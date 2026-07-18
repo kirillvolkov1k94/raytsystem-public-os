@@ -387,7 +387,7 @@ class WorkflowService:
             node, step, record = self._waiting_step(
                 store, run, node_id, expected=WorkflowNodeType.APPROVAL
             )
-            gate = self._approval_gate(store, node)
+            gate = self._canonical_approval_gate(store, node)
             if step.started_at is None:
                 raise WorkflowError("Workflow approval waiting time is invalid")
             gate_expires_at = step.started_at + timedelta(seconds=gate.expires_after_seconds)
@@ -405,6 +405,7 @@ class WorkflowService:
                     approval = AuthorityResolver(self.root).require_workflow_approval(
                         store,
                         approval_id,
+                        action=gate.action,
                         target_id=workflow_approval_target(workflow_run_id, node_id),
                         artifact_sha256=run.input_sha256,
                         required_role=gate.required_role,
@@ -876,6 +877,29 @@ class WorkflowService:
         if record is None:
             raise WorkflowError("Workflow approval gate is missing")
         return WorkflowApprovalGate.model_validate(record.payload)
+
+    def _canonical_approval_gate(
+        self, store: PlatformStore, node: WorkflowNode
+    ) -> WorkflowApprovalGate:
+        gate_id = node.approval_gate_id
+        if gate_id is None:
+            raise WorkflowError("Approval nodes require a typed approval gate")
+        record = store.head("workflow_approval_gate", gate_id)
+        if (
+            record is None
+            or record.kind != "workflow_approval_gate"
+            or record.record_id != gate_id
+            or record.revision != 1
+            or record.state != "registered"
+        ):
+            raise WorkflowError("Workflow approval gate is not canonical")
+        try:
+            gate = WorkflowApprovalGate.model_validate(record.payload)
+        except ValidationError as error:
+            raise WorkflowError("Workflow approval gate contract is invalid") from error
+        if gate.approval_gate_id != gate_id or gate.action != _APPROVAL_ACTION:
+            raise WorkflowError("Workflow approval gate binding is invalid")
+        return gate
 
     def _require_node_references(self, store: PlatformStore, revision: WorkflowRevision) -> None:
         for node in revision.nodes:

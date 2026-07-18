@@ -196,6 +196,52 @@ def _step_head(root: Path, workflow_run_id: str) -> StoredRecord:
     return record
 
 
+def _make_gate_head_noncanonical(root: Path, mutation: str) -> None:
+    with initialize_platform_store(root) as store:
+        record = store.head("workflow_approval_gate", GATE.approval_gate_id)
+        assert record is not None
+        if mutation == "revision":
+            store.append_record(
+                kind=record.kind,
+                record_id=record.record_id,
+                payload=record.payload,
+                state=record.state,
+                expected_revision=record.revision,
+            )
+            return
+        if mutation == "state":
+            with store.transaction():
+                store.connection.execute(
+                    "UPDATE records SET state='rejected' "
+                    "WHERE kind=? AND record_id=? AND revision=?",
+                    (record.kind, record.record_id, record.revision),
+                )
+            return
+        changed = dict(record.payload)
+        if mutation == "payload_id":
+            changed["approval_gate_id"] = "wgate_authority_alias"
+        else:
+            changed["action"] = "delete_data"
+        rendered = canonical_json_bytes(changed)
+        digest = sha256_hex(rendered)
+        with store.transaction():
+            store.connection.execute(
+                "UPDATE records SET payload_json=?, payload_sha256=? "
+                "WHERE kind=? AND record_id=? AND revision=?",
+                (
+                    rendered.decode("utf-8"),
+                    digest,
+                    record.kind,
+                    record.record_id,
+                    record.revision,
+                ),
+            )
+            store.connection.execute(
+                "UPDATE record_heads SET payload_sha256=? WHERE kind=? AND record_id=?",
+                (digest, record.kind, record.record_id),
+            )
+
+
 class _NoOffsetTimezone(tzinfo):
     def utcoffset(self, _value: datetime | None) -> None:
         return None
@@ -669,6 +715,41 @@ def test_grant_rejects_noncanonical_approval_record_head(tmp_path: Path, invalid
         )
 
     assert _step_head(root, workflow_run_id).state == "waiting"
+
+
+@pytest.mark.parametrize("invalid_gate", ["wrong_action", "payload_id", "state", "revision"])
+def test_grant_rejects_noncanonical_approval_gate_head(
+    tmp_path: Path, invalid_gate: str
+) -> None:
+    root = make_platform_workspace(tmp_path / invalid_gate)
+    service, workflow_run_id = _start_waiting(root)
+    approval = ApprovalAuthorityService(root).issue_approval(
+        workflow_run_id,
+        "step_gate",
+        approver=APPROVER,
+        idempotency_key=f"approval_authority_gate_{invalid_gate}",
+        at=WAIT_STARTED + timedelta(seconds=10),
+    )
+    _make_gate_head_noncanonical(root, invalid_gate)
+
+    with pytest.raises(WorkflowError, match="gate"):
+        service.grant_approval(
+            workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            at=WAIT_STARTED + timedelta(seconds=20),
+        )
+
+    step = _step_head(root, workflow_run_id)
+    assert step.state == "waiting"
+    assert step.payload.get("approval_id") is None
+    assert "output" not in step.payload
+    with initialize_platform_store(root) as store:
+        event_types = tuple(
+            event["event_type"] for event in store.list_events(workflow_run_id)
+        )
+    assert "workflow_approval_granted" not in event_types
 
 
 @pytest.mark.parametrize(

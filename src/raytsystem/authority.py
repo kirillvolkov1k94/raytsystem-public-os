@@ -383,6 +383,7 @@ class AuthorityResolver:
         store: PlatformStore,
         approval_id: str,
         *,
+        action: str,
         target_id: str,
         artifact_sha256: str,
         required_role: str,
@@ -396,6 +397,8 @@ class AuthorityResolver:
 
         if store.root != self.root or not store.connection.in_transaction:
             raise AuthorityError("Workflow approval requires a locked platform transaction")
+        if action != _WORKFLOW_APPROVAL_ACTION:
+            raise AuthorityError("Workflow approval action is unsupported")
         try:
             record = store.head("authority_approval", approval_id)
         except (PlatformStoreError, TypeError, ValueError) as error:
@@ -411,7 +414,7 @@ class AuthorityResolver:
         try:
             approval = ApprovalRecord.model_validate(record.payload)
             expected = ApprovalRecord.create(
-                action=_WORKFLOW_APPROVAL_ACTION,
+                action=action,
                 target_id=target_id,
                 artifact_sha256=artifact_sha256,
                 scope=(required_role,),
