@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from raytsystem.authority import AuthorityError, AuthorityResolver, workflow_approval_target
 from raytsystem.contracts import (
@@ -26,6 +27,7 @@ from raytsystem.emergency import EmergencyService
 from raytsystem.features import FeatureConfig, load_feature_config
 from raytsystem.platform_store import (
     PlatformStore,
+    PlatformStoreError,
     StoredRecord,
     initialize_platform_store,
     open_platform_store_read_only,
@@ -39,6 +41,96 @@ _ENGINE_ACTOR = "raytsystem_workflow_engine"
 _CANCELLABLE_RUN_STATES = frozenset({"planned", "running", "paused"})
 _DONE_STEP_STATES = frozenset({"succeeded", "skipped"})
 _STEP_EXTRA_KEYS = frozenset({"output", "failure_reason"})
+_APPROVAL_DECISION_SCOPE = "workflow_approval_decision"
+
+
+class _WorkflowDecisionReceipt(BaseModel):
+    """Immutable internal proof for one exact workflow approval transition."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=False)
+
+    receipt_id: str
+    idempotency_key: str = Field(min_length=1, max_length=256)
+    request_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    decision: Literal["grant", "deny"]
+    workflow_run_id: str
+    step_run_id: str
+    node_id: str
+    approval_id: str | None
+    actor_id: str
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    approval_gate_id: str
+    gate_action: str
+    required_role: str
+    policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    policy_version: str
+    gate_expires_at: datetime
+    decided_at: datetime
+    event_id: str
+    terminal_step_state: Literal["succeeded", "failed"]
+    step_revision: int = Field(ge=1)
+    run_revision: int = Field(ge=1)
+    result: WorkflowRun
+
+    @model_validator(mode="after")
+    def _exact_binding(self) -> _WorkflowDecisionReceipt:
+        if (
+            not self.idempotency_key
+            or any(character.isspace() for character in self.idempotency_key)
+            or self.gate_expires_at.tzinfo is None
+            or self.gate_expires_at.utcoffset() is None
+            or self.decided_at.tzinfo is None
+            or self.decided_at.utcoffset() is None
+            or self.result.workflow_run_id != self.workflow_run_id
+        ):
+            raise ValueError("Workflow decision receipt binding is invalid")
+        expected_state = "succeeded" if self.decision == "grant" else "failed"
+        expected_run_state = "running" if self.decision == "grant" else "failed"
+        if (
+            self.terminal_step_state != expected_state
+            or self.result.state != expected_run_state
+            or (self.decision == "grant") != (self.approval_id is not None)
+            or (self.decision == "grant" and self.decided_at >= self.gate_expires_at)
+        ):
+            raise ValueError("Workflow decision receipt result is invalid")
+        if self.request_sha256 != sha256_hex(canonical_json_bytes(self.request_payload())):
+            raise ValueError("Workflow decision receipt request hash is invalid")
+        return self
+
+    def request_payload(self) -> dict[str, Any]:
+        return {
+            "workflow_run_id": self.workflow_run_id,
+            "step_run_id": self.step_run_id,
+            "node_id": self.node_id,
+            "decision": self.decision,
+            "approval_id": self.approval_id,
+            "actor_id": self.actor_id,
+            "input_sha256": self.input_sha256,
+            "approval_gate_id": self.approval_gate_id,
+            "gate_action": self.gate_action,
+            "required_role": self.required_role,
+            "policy_sha256": self.policy_sha256,
+            "policy_version": self.policy_version,
+            "gate_expires_at": self.gate_expires_at,
+        }
+
+    def identity_payload(self) -> dict[str, Any]:
+        return self.model_dump(mode="python", exclude={"receipt_id"})
+
+    def verify_id(self) -> bool:
+        return self.receipt_id == derive_id("wdec", self.identity_payload())
+
+
+@dataclass(frozen=True)
+class _WorkflowDecisionContext:
+    run: WorkflowRun
+    run_record: StoredRecord
+    inputs: dict[str, Any]
+    node: WorkflowNode
+    step: WorkflowStepRun
+    step_record: StoredRecord
+    gate: WorkflowApprovalGate
+    gate_expires_at: datetime
 
 
 def _identity_operation(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -365,38 +457,43 @@ class WorkflowService:
         *,
         approval_id: str,
         actor_id: str,
+        idempotency_key: str,
         at: datetime | None = None,
     ) -> WorkflowRun:
         self._require_enabled()
         EmergencyService(self.root, features=self.features).assert_runtime_allowed()
+        self._require_decision_key(idempotency_key)
         if not approval_id:
             raise WorkflowError("Workflow approval requires an explicit approval ID")
-        requested_at: datetime | None = None
-        if at is not None:
-            try:
-                if at.tzinfo is None or at.utcoffset() is None:
-                    raise WorkflowError("Workflow approval time must be timezone-aware")
-                requested_at = at.astimezone(UTC)
-            except (TypeError, ValueError) as error:
-                raise WorkflowError("Workflow approval time must be timezone-aware") from error
+        requested_at = self._decision_time(at)
         expired = False
         granted_run: WorkflowRun | None = None
         with initialize_platform_store(self.root) as store, store.transaction():
             now = requested_at or datetime.now(UTC)
-            run, _, _ = self._load_run(store, workflow_run_id, expected_state="running")
-            node, step, record = self._waiting_step(
-                store, run, node_id, expected=WorkflowNodeType.APPROVAL
+            context = self._workflow_decision_context(store, workflow_run_id, node_id)
+            request = self._workflow_decision_request(
+                context,
+                decision="grant",
+                approval_id=approval_id,
+                actor_id=actor_id,
             )
-            gate = self._canonical_approval_gate(store, node)
-            if step.started_at is None:
+            prior = self._workflow_decision_receipt(
+                store,
+                idempotency_key=idempotency_key,
+                request=request,
+            )
+            if prior is not None:
+                return self._replay_workflow_decision(store, context, prior)
+            self._require_waiting_decision(context)
+            waiting_since = context.step.started_at
+            if waiting_since is None:
                 raise WorkflowError("Workflow approval waiting time is invalid")
-            gate_expires_at = step.started_at + timedelta(seconds=gate.expires_after_seconds)
-            if now >= gate_expires_at:
-                failed = step.model_copy(update={"state": "failed", "completed_at": now})
+            if now >= context.gate_expires_at:
+                failed = context.step.model_copy(update={"state": "failed", "completed_at": now})
                 self._persist_step(
                     store,
                     failed,
-                    record.revision,
+                    context.step_record.revision,
                     extra={"failure_reason": "approval_expired"},
                 )
                 expired = True
@@ -405,21 +502,21 @@ class WorkflowService:
                     approval = AuthorityResolver(self.root).require_workflow_approval(
                         store,
                         approval_id,
-                        action=gate.action,
+                        action=context.gate.action,
                         target_id=workflow_approval_target(workflow_run_id, node_id),
-                        artifact_sha256=run.input_sha256,
-                        required_role=gate.required_role,
-                        policy_version=gate.schema_version,
-                        policy_sha256=gate.scope_sha256,
-                        waiting_since=step.started_at,
-                        gate_expires_at=gate_expires_at,
+                        artifact_sha256=context.run.input_sha256,
+                        required_role=context.gate.required_role,
+                        policy_version=context.gate.schema_version,
+                        policy_sha256=context.gate.scope_sha256,
+                        waiting_since=waiting_since,
+                        gate_expires_at=context.gate_expires_at,
                         at=now,
                     )
                 except AuthorityError as error:
                     raise WorkflowError("Workflow approval authority is invalid") from error
                 output = {"approval_id": approval.approval_id, "granted_by": actor_id}
                 output_bytes = self._safe_payload(output, label="Workflow output")
-                granted = step.model_copy(
+                granted = context.step.model_copy(
                     update={
                         "state": "succeeded",
                         "approval_id": approval.approval_id,
@@ -427,16 +524,33 @@ class WorkflowService:
                         "completed_at": now,
                     }
                 )
-                self._persist_step(store, granted, record.revision, extra={"output": output})
-                store.append_event(
+                persisted_step = self._persist_step(
+                    store,
+                    granted,
+                    context.step_record.revision,
+                    extra={"output": output},
+                )
+                event = store.append_event(
                     stream_id=workflow_run_id,
-                    aggregate_id=step.step_run_id,
+                    aggregate_id=context.step.step_run_id,
                     event_type="workflow_approval_granted",
                     actor_id=actor_id,
                     payload_schema="workflow_step_run_v1",
                     payload={"node_id": node_id, "approval_id": approval.approval_id},
                 )
-                granted_run = run
+                receipt = self._new_workflow_decision_receipt(
+                    idempotency_key=idempotency_key,
+                    request=request,
+                    context=context,
+                    decided_at=now,
+                    event_id=str(event["event_id"]),
+                    terminal_step_state="succeeded",
+                    step_revision=persisted_step.revision,
+                    run_revision=context.run_record.revision,
+                    result=context.run,
+                )
+                self._store_workflow_decision_receipt(store, receipt)
+                granted_run = context.run
         if expired:
             raise WorkflowError("Workflow approval gate has expired")
         if granted_run is None:
@@ -449,32 +563,64 @@ class WorkflowService:
         node_id: str,
         *,
         actor_id: str,
+        idempotency_key: str,
         at: datetime | None = None,
     ) -> WorkflowRun:
         self._require_enabled()
         EmergencyService(self.root, features=self.features).assert_runtime_allowed()
-        now = (at or datetime.now(UTC)).astimezone(UTC)
-        with initialize_platform_store(self.root) as store:
-            run, run_record, inputs = self._load_run(
-                store, workflow_run_id, expected_state="running"
+        self._require_decision_key(idempotency_key)
+        requested_at = self._decision_time(at)
+        with initialize_platform_store(self.root) as store, store.transaction():
+            now = requested_at or datetime.now(UTC)
+            context = self._workflow_decision_context(store, workflow_run_id, node_id)
+            request = self._workflow_decision_request(
+                context,
+                decision="deny",
+                approval_id=None,
+                actor_id=actor_id,
             )
-            _, step, record = self._waiting_step(
-                store, run, node_id, expected=WorkflowNodeType.APPROVAL
+            prior = self._workflow_decision_receipt(
+                store,
+                idempotency_key=idempotency_key,
+                request=request,
             )
-            denied = step.model_copy(update={"state": "failed", "completed_at": now})
-            self._persist_step(
-                store, denied, record.revision, extra={"failure_reason": "approval_denied"}
+            if prior is not None:
+                return self._replay_workflow_decision(store, context, prior)
+            self._require_waiting_decision(context)
+            denied = context.step.model_copy(update={"state": "failed", "completed_at": now})
+            persisted_step = self._persist_step(
+                store,
+                denied,
+                context.step_record.revision,
+                extra={"failure_reason": "approval_denied"},
             )
-            failed_run = run.model_copy(update={"state": "failed", "completed_at": now})
-            self._persist_run(store, failed_run, run_record.revision, inputs)
-            store.append_event(
+            failed_run = context.run.model_copy(update={"state": "failed", "completed_at": now})
+            persisted_run = self._persist_run(
+                store,
+                failed_run,
+                context.run_record.revision,
+                context.inputs,
+            )
+            event = store.append_event(
                 stream_id=workflow_run_id,
-                aggregate_id=step.step_run_id,
+                aggregate_id=context.step.step_run_id,
                 event_type="workflow_approval_denied",
                 actor_id=actor_id,
                 payload_schema="workflow_step_run_v1",
                 payload={"node_id": node_id},
             )
+            receipt = self._new_workflow_decision_receipt(
+                idempotency_key=idempotency_key,
+                request=request,
+                context=context,
+                decided_at=now,
+                event_id=str(event["event_id"]),
+                terminal_step_state="failed",
+                step_revision=persisted_step.revision,
+                run_revision=persisted_run.revision,
+                result=failed_run,
+            )
+            self._store_workflow_decision_receipt(store, receipt)
             return failed_run
 
     def wake(
@@ -799,8 +945,8 @@ class WorkflowService:
         run: WorkflowRun,
         expected_revision: int,
         inputs: dict[str, Any],
-    ) -> None:
-        store.append_record(
+    ) -> StoredRecord:
+        return store.append_record(
             kind="workflow_run",
             record_id=run.workflow_run_id,
             payload=run.model_dump(mode="json") | {"inputs": inputs},
@@ -838,6 +984,316 @@ class WorkflowService:
             key: value for key, value in record.payload.items() if key not in _STEP_EXTRA_KEYS
         }
         return WorkflowStepRun.model_validate(payload)
+
+    def _workflow_decision_context(
+        self,
+        store: PlatformStore,
+        workflow_run_id: str,
+        node_id: str,
+    ) -> _WorkflowDecisionContext:
+        try:
+            run, run_record, inputs = self._load_run(store, workflow_run_id)
+            if (
+                run_record.kind != "workflow_run"
+                or run_record.record_id != workflow_run_id
+                or run_record.state != run.state
+                or run.workflow_run_id != workflow_run_id
+                or not isinstance(run_record.payload.get("inputs"), dict)
+                or sha256_hex(canonical_json_bytes(inputs)) != run.input_sha256
+            ):
+                raise WorkflowError("Workflow run input binding is invalid")
+            revision = self._revision(store, run.revision_id)
+            node = next((item for item in revision.nodes if item.node_id == node_id), None)
+            if node is None or node.node_type is not WorkflowNodeType.APPROVAL:
+                raise WorkflowError("Workflow node does not accept this transition")
+            matching_steps: list[StoredRecord] = []
+            for step_run_id in run.step_run_ids:
+                record = store.head("workflow_step", step_run_id)
+                if record is None:
+                    raise WorkflowError("Workflow step record is missing")
+                if record.payload.get("node_id") == node_id:
+                    matching_steps.append(record)
+            if len(matching_steps) != 1:
+                raise WorkflowError("Workflow node has no unique approval step")
+            step_record = matching_steps[0]
+            step = self._step_from_record(step_record)
+            if (
+                step_record.kind != "workflow_step"
+                or step_record.record_id != step.step_run_id
+                or step_record.state != step.state
+                or step.step_run_id not in run.step_run_ids
+                or step.workflow_run_id != workflow_run_id
+                or step.node_id != node_id
+                or step.input_sha256 != run.input_sha256
+                or step.started_at is None
+            ):
+                raise WorkflowError("Workflow approval step binding is invalid")
+            gate = self._canonical_approval_gate(store, node)
+            gate_expires_at = step.started_at.astimezone(UTC) + timedelta(
+                seconds=gate.expires_after_seconds
+            )
+        except WorkflowError:
+            raise
+        except (PlatformStoreError, ValidationError, TypeError, ValueError) as error:
+            raise WorkflowError("Workflow approval decision binding is invalid") from error
+        return _WorkflowDecisionContext(
+            run=run,
+            run_record=run_record,
+            inputs=inputs,
+            node=node,
+            step=step,
+            step_record=step_record,
+            gate=gate,
+            gate_expires_at=gate_expires_at,
+        )
+
+    @staticmethod
+    def _workflow_decision_request(
+        context: _WorkflowDecisionContext,
+        *,
+        decision: Literal["grant", "deny"],
+        approval_id: str | None,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "workflow_run_id": context.run.workflow_run_id,
+            "step_run_id": context.step.step_run_id,
+            "node_id": context.node.node_id,
+            "decision": decision,
+            "approval_id": approval_id,
+            "actor_id": actor_id,
+            "input_sha256": context.run.input_sha256,
+            "approval_gate_id": context.gate.approval_gate_id,
+            "gate_action": context.gate.action,
+            "required_role": context.gate.required_role,
+            "policy_sha256": context.gate.scope_sha256,
+            "policy_version": context.gate.schema_version,
+            "gate_expires_at": context.gate_expires_at,
+        }
+
+    def _workflow_decision_receipt(
+        self,
+        store: PlatformStore,
+        *,
+        idempotency_key: str,
+        request: dict[str, Any],
+    ) -> _WorkflowDecisionReceipt | None:
+        try:
+            stored = store.idempotent_receipt(
+                scope=_APPROVAL_DECISION_SCOPE,
+                idempotency_key=idempotency_key,
+                request=request,
+            )
+            if stored is None:
+                return None
+            receipt = _WorkflowDecisionReceipt.model_validate(stored)
+            if (
+                receipt.idempotency_key != idempotency_key
+                or receipt.request_payload() != request
+                or not receipt.verify_id()
+            ):
+                raise WorkflowError("Workflow approval decision receipt is corrupt")
+            return receipt
+        except WorkflowError:
+            raise
+        except (PlatformStoreError, ValidationError, TypeError, ValueError) as error:
+            raise WorkflowError(
+                "Workflow approval decision idempotency receipt is invalid"
+            ) from error
+
+    @staticmethod
+    def _new_workflow_decision_receipt(
+        *,
+        idempotency_key: str,
+        request: dict[str, Any],
+        context: _WorkflowDecisionContext,
+        decided_at: datetime,
+        event_id: str,
+        terminal_step_state: Literal["succeeded", "failed"],
+        step_revision: int,
+        run_revision: int,
+        result: WorkflowRun,
+    ) -> _WorkflowDecisionReceipt:
+        draft = _WorkflowDecisionReceipt(
+            receipt_id="wdec_pending",
+            idempotency_key=idempotency_key,
+            request_sha256=sha256_hex(canonical_json_bytes(request)),
+            decision=request["decision"],
+            workflow_run_id=context.run.workflow_run_id,
+            step_run_id=context.step.step_run_id,
+            node_id=context.node.node_id,
+            approval_id=request["approval_id"],
+            actor_id=request["actor_id"],
+            input_sha256=context.run.input_sha256,
+            approval_gate_id=context.gate.approval_gate_id,
+            gate_action=context.gate.action,
+            required_role=context.gate.required_role,
+            policy_sha256=context.gate.scope_sha256,
+            policy_version=context.gate.schema_version,
+            gate_expires_at=context.gate_expires_at,
+            decided_at=decided_at,
+            event_id=event_id,
+            terminal_step_state=terminal_step_state,
+            step_revision=step_revision,
+            run_revision=run_revision,
+            result=result,
+        )
+        return draft.model_copy(update={"receipt_id": derive_id("wdec", draft.identity_payload())})
+
+    @staticmethod
+    def _store_workflow_decision_receipt(
+        store: PlatformStore,
+        receipt: _WorkflowDecisionReceipt,
+    ) -> None:
+        stored = store.idempotent_receipt(
+            scope=_APPROVAL_DECISION_SCOPE,
+            idempotency_key=receipt.idempotency_key,
+            request=receipt.request_payload(),
+            receipt=receipt.model_dump(mode="json"),
+        )
+        if stored != receipt.model_dump(mode="json"):
+            raise WorkflowError("Workflow approval decision receipt changed concurrently")
+
+    def _replay_workflow_decision(
+        self,
+        store: PlatformStore,
+        context: _WorkflowDecisionContext,
+        receipt: _WorkflowDecisionReceipt,
+    ) -> WorkflowRun:
+        try:
+            historical_run = store.record(
+                "workflow_run", receipt.workflow_run_id, receipt.run_revision
+            )
+            if historical_run is None:
+                raise WorkflowError("Workflow approval decision receipt is orphaned")
+            historical_payload = dict(historical_run.payload)
+            historical_inputs = historical_payload.pop("inputs", None)
+            if (
+                not isinstance(historical_inputs, dict)
+                or historical_run.kind != "workflow_run"
+                or historical_run.record_id != receipt.workflow_run_id
+                or historical_run.state != receipt.result.state
+                or WorkflowRun.model_validate(historical_payload) != receipt.result
+                or sha256_hex(canonical_json_bytes(historical_inputs)) != receipt.input_sha256
+            ):
+                raise WorkflowError("Workflow approval decision result receipt is corrupt")
+            step = context.step
+            step_record = context.step_record
+            expected_output = {
+                "approval_id": receipt.approval_id,
+                "granted_by": receipt.actor_id,
+            }
+            if (
+                step_record.revision != receipt.step_revision
+                or step_record.state != receipt.terminal_step_state
+                or step.state != receipt.terminal_step_state
+                or step.completed_at != receipt.decided_at
+            ):
+                raise WorkflowError("Workflow approval decision terminal receipt is orphaned")
+            if receipt.decision == "grant":
+                expected_output_sha256 = sha256_hex(
+                    canonical_json_bytes(expected_output)
+                )
+                if (
+                    step.approval_id != receipt.approval_id
+                    or step.output_sha256 != expected_output_sha256
+                    or step_record.payload.get("output") != expected_output
+                    or "failure_reason" in step_record.payload
+                ):
+                    raise WorkflowError("Workflow approval grant receipt is corrupt")
+                waiting_since = step.started_at
+                if waiting_since is None or receipt.approval_id is None:
+                    raise WorkflowError("Workflow approval grant receipt is corrupt")
+                try:
+                    AuthorityResolver(self.root).require_workflow_approval(
+                        store,
+                        receipt.approval_id,
+                        action=receipt.gate_action,
+                        target_id=workflow_approval_target(
+                            receipt.workflow_run_id, receipt.node_id
+                        ),
+                        artifact_sha256=receipt.input_sha256,
+                        required_role=receipt.required_role,
+                        policy_version=receipt.policy_version,
+                        policy_sha256=receipt.policy_sha256,
+                        waiting_since=waiting_since,
+                        gate_expires_at=receipt.gate_expires_at,
+                        at=receipt.decided_at,
+                    )
+                except AuthorityError as error:
+                    raise WorkflowError(
+                        "Workflow approval grant receipt authority is invalid"
+                    ) from error
+                expected_event_type = "workflow_approval_granted"
+                expected_event_payload = {
+                    "node_id": receipt.node_id,
+                    "approval_id": receipt.approval_id,
+                }
+            else:
+                if (
+                    step.approval_id is not None
+                    or step.output_sha256 is not None
+                    or step_record.payload.get("failure_reason") != "approval_denied"
+                    or "output" in step_record.payload
+                    or context.run_record.revision != receipt.run_revision
+                    or context.run != receipt.result
+                ):
+                    raise WorkflowError("Workflow approval denial receipt is corrupt")
+                expected_event_type = "workflow_approval_denied"
+                expected_event_payload = {"node_id": receipt.node_id}
+            event = store.event(receipt.event_id)
+            if (
+                event is None
+                or not store.verify_event_stream(receipt.workflow_run_id)
+                or event["stream_id"] != receipt.workflow_run_id
+                or event["aggregate_id"] != receipt.step_run_id
+                or event["event_type"] != expected_event_type
+                or event["actor_id"] != receipt.actor_id
+                or event["payload_schema"] != "workflow_step_run_v1"
+                or event["payload"] != expected_event_payload
+            ):
+                raise WorkflowError("Workflow approval decision event receipt is orphaned")
+            return receipt.result
+        except WorkflowError:
+            raise
+        except (PlatformStoreError, ValidationError, TypeError, ValueError) as error:
+            raise WorkflowError("Workflow approval decision receipt is corrupt") from error
+
+    @staticmethod
+    def _require_waiting_decision(context: _WorkflowDecisionContext) -> None:
+        if context.run.state != "running" or context.run_record.state != "running":
+            raise WorkflowError("Workflow run must be running for this transition")
+        if (
+            context.step.state != "waiting"
+            or context.step_record.state != "waiting"
+            or context.step.completed_at is not None
+            or context.step.approval_id is not None
+            or context.step.output_sha256 is not None
+            or "output" in context.step_record.payload
+            or "failure_reason" in context.step_record.payload
+        ):
+            raise WorkflowError("Workflow step is not waiting")
+
+    @staticmethod
+    def _require_decision_key(idempotency_key: str) -> None:
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key
+            or len(idempotency_key) > 256
+            or any(character.isspace() for character in idempotency_key)
+        ):
+            raise WorkflowError("Workflow approval decision requires an exact idempotency key")
+
+    @staticmethod
+    def _decision_time(at: datetime | None) -> datetime | None:
+        if at is None:
+            return None
+        try:
+            if at.tzinfo is None or at.utcoffset() is None:
+                raise WorkflowError("Workflow approval time must be timezone-aware")
+            return at.astimezone(UTC)
+        except (TypeError, ValueError) as error:
+            raise WorkflowError("Workflow approval time must be timezone-aware") from error
 
     def _waiting_step(
         self,

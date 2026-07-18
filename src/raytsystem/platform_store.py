@@ -283,6 +283,19 @@ class PlatformStore:
         ).fetchone()
         return None if row is None else _stored_record(row)
 
+    def record(self, kind: str, record_id: str, revision: int) -> StoredRecord | None:
+        """Read one immutable record revision with its payload integrity verified."""
+
+        _validate_token(kind, "record kind")
+        _validate_token(record_id, "record ID")
+        if revision < 1:
+            raise ValueError("Record revision must be positive")
+        row = self.connection.execute(
+            "SELECT * FROM records WHERE kind=? AND record_id=? AND revision=?",
+            (kind, record_id, revision),
+        ).fetchone()
+        return None if row is None else _stored_record(row)
+
     def list_heads(
         self,
         kind: str,
@@ -388,6 +401,21 @@ class PlatformStore:
             (stream_id, limit),
         ).fetchall()
         return tuple(_event_payload(row) for row in rows)
+
+    def event(self, event_id: str) -> dict[str, Any] | None:
+        """Read one immutable audit event after validating its exact identity and payload hash."""
+
+        _validate_token(event_id, "event ID")
+        row = self.connection.execute(
+            "SELECT * FROM audit_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        if sha256_hex(str(row["payload_json"]).encode("utf-8")) != row["payload_sha256"]:
+            raise PlatformStoreError("Audit event payload hash is invalid")
+        if str(row["event_id"]) != derive_id("aevt", _event_identity(row)):
+            raise PlatformStoreError("Audit event identity is invalid")
+        return _event_payload(row)
 
     def event_count(self) -> int:
         """Return the total append-only audit backlog without exposing event payloads."""

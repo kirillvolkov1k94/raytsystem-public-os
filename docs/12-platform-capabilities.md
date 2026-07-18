@@ -132,7 +132,9 @@ its parent). Flags that gate an external surface stay off:
   registered operation IDs — raw shell strings fail validation.
 - Cycle rejection, per-node retry policies, timeout enforcement, approval gates bound to fresh
   approvals, explicit pause/resume/cancel with state guards, persisted step outputs for crash
-  recovery, and DAG graph data for the UI.
+  recovery, exact idempotent grant/deny receipts committed with the transition event, and DAG graph
+  data for the UI. Approval decision retries require the original key and exact run/node/step,
+  actor, input, gate/policy/expiry, decision, and approval-ID binding.
 - CLI: `raytsystem workflow list | approve | cancel`.
 
 ## Notifications

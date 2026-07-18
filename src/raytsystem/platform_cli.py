@@ -580,6 +580,7 @@ def register_platform_commands(app: typer.Typer) -> None:
         workflow_run_id: str,
         node_id: str,
         approval_id: Annotated[str, typer.Option("--approval-id")],
+        idempotency_key: Annotated[str, typer.Option("--idempotency-key")],
         root: RootOption = Path.cwd(),
         json_output: JsonOption = False,
     ) -> None:
@@ -589,7 +590,11 @@ def register_platform_commands(app: typer.Typer) -> None:
             lambda: (
                 WorkflowService(root)
                 .grant_approval(
-                    workflow_run_id, node_id, approval_id=approval_id, actor_id="user_local_cli"
+                    workflow_run_id,
+                    node_id,
+                    approval_id=approval_id,
+                    actor_id="user_local_cli",
+                    idempotency_key=idempotency_key,
                 )
                 .model_dump(mode="json")
             ),

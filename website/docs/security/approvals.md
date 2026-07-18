@@ -83,9 +83,18 @@ idempotency binding — pending target и caller key — сохраняются 
 key, run/node binding, входа или gate отклоняется без второй записи. Истёкший gate, неверный node
 и шаг не в состоянии `waiting` также отклоняются.
 
-Issuance не меняет состояние workflow. Единственный переход approval-шага остаётся в
-`WorkflowService.grant_approval()`, который повторно проверяет точный authority record перед
-переходом.
+Issuance не меняет состояние workflow. Публичные переходы
+`WorkflowService.grant_approval(..., idempotency_key=...)` и
+`deny_approval(..., idempotency_key=...)` требуют непустой точный ключ. При первом вызове
+движок одной транзакцией `BEGIN IMMEDIATE` фиксирует переход шага/запуска, audit event и
+immutable receipt. Receipt связывает решение с run, node, step, входным хэшем, actor,
+approval ID (только для grant), gate ID/action/role, версией и хэшем политики и сроком gate.
+
+Если вызывающая сторона упала после commit, повтор с тем же ключом и теми же параметрами сначала
+проверяет receipt и точное terminal-состояние/event, затем возвращает исходный `WorkflowRun` без
+второго перехода. Другой ключ после terminal-перехода, переиспользование ключа с изменённой
+привязкой и orphan/corrupt receipt отклоняются fail-closed. Grant повторно проверяет канонический
+gate и точный accepted `ApprovalRecord`; deny не создаёт и не потребляет approval record.
 
 ## Пример
 
@@ -95,7 +104,8 @@ Issuance не меняет состояние workflow. Единственный
 ```bash
 uv run raytsystem mcp approve
 uv run raytsystem package approve
-uv run raytsystem workflow approve
+uv run raytsystem workflow approve <run_id> <node_id> \
+  --approval-id <approval_id> --idempotency-key <stable_retry_key>
 ```
 
 Оценить, какое решение вынесет политика для гипотетического действия, можно в симуляторе
@@ -120,6 +130,8 @@ uv run raytsystem workflow approve
 
 - Пытаться применить approval после правки payload — хэш не совпадёт.
 - Ожидать, что approval «широкого» scope закроет действие вне его привязки к цели/destination.
+- Повторять workflow approve с новым ключом после неясного ответа: используйте исходный
+  `--idempotency-key`, иначе terminal-шаг не будет принят за успешный replay.
 
 ## Связанные страницы
 

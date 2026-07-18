@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event, get_ident
 from typing import Any
 
 import pytest
@@ -23,7 +27,11 @@ from raytsystem.contracts import (
     sha256_hex,
 )
 from raytsystem.contracts.workflows import WorkflowNodeType
-from raytsystem.platform_store import initialize_platform_store, open_platform_store_read_only
+from raytsystem.platform_store import (
+    PlatformStore,
+    initialize_platform_store,
+    open_platform_store_read_only,
+)
 from raytsystem.workflows import ApprovalAuthorityService, WorkflowError, WorkflowService
 from raytsystem.workflows.service import workflow_approval_target
 
@@ -37,6 +45,7 @@ GATE = WorkflowApprovalGate(
     required_role="role_operator",
     expires_after_seconds=120,
 )
+DECISION_WAIT_STARTED = datetime(2040, 2, 3, 4, 5, 6, tzinfo=UTC)
 
 
 def _node(
@@ -123,6 +132,87 @@ def _step_head(root: Path, step_run_id: str) -> Any:
         record = store.head("workflow_step", step_run_id)
     assert record is not None
     return record
+
+
+def _waiting_approval(
+    root: Path,
+    *,
+    start_key: str = "workflow_decision_start",
+    inputs: dict[str, Any] | None = None,
+) -> tuple[WorkflowService, WorkflowRun, ApprovalRecord]:
+    service, revision = _registered(
+        root,
+        (
+            _node(
+                "step_gate",
+                WorkflowNodeType.APPROVAL,
+                approval_gate_id=GATE.approval_gate_id,
+            ),
+        ),
+        (),
+        approval_gates=(GATE,),
+    )
+    run = service.start(
+        revision.revision_id,
+        inputs or {"seed": "value"},
+        actor_id=ACTOR,
+        idempotency_key=start_key,
+    )
+    service.run_ready_steps(run.workflow_run_id, at=DECISION_WAIT_STARTED)
+    approval = ApprovalAuthorityService(root).issue_approval(
+        run.workflow_run_id,
+        "step_gate",
+        approver=ACTOR,
+        idempotency_key=f"{start_key}_authority",
+        at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+    )
+    return service, run, approval
+
+
+def _decision_events(root: Path, workflow_run_id: str) -> tuple[dict[str, Any], ...]:
+    store = open_platform_store_read_only(root)
+    assert store is not None
+    with store:
+        return tuple(
+            event
+            for event in store.list_events(workflow_run_id)
+            if event["event_type"]
+            in {"workflow_approval_granted", "workflow_approval_denied"}
+        )
+
+
+def _decision_receipt_count(root: Path) -> int:
+    store = open_platform_store_read_only(root)
+    assert store is not None
+    with store:
+        row = store.connection.execute(
+            "SELECT COUNT(*) FROM idempotency_receipts "
+            "WHERE scope='workflow_approval_decision'"
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+def _rewrite_head_payload(
+    root: Path,
+    kind: str,
+    record_id: str,
+    payload: dict[str, Any],
+) -> None:
+    rendered = canonical_json_bytes(payload)
+    payload_sha256 = sha256_hex(rendered)
+    with initialize_platform_store(root) as store, store.transaction():
+        head = store.head(kind, record_id)
+        assert head is not None
+        store.connection.execute(
+            "UPDATE records SET payload_json=?, payload_sha256=? "
+            "WHERE kind=? AND record_id=? AND revision=?",
+            (rendered.decode("utf-8"), payload_sha256, kind, record_id, head.revision),
+        )
+        store.connection.execute(
+            "UPDATE record_heads SET payload_sha256=? WHERE kind=? AND record_id=?",
+            (payload_sha256, kind, record_id),
+        )
 
 
 def test_workflow_cycle_is_rejected_at_registration(tmp_path: Path) -> None:
@@ -233,6 +323,7 @@ def test_wait_timeout_and_approval_expiry_fail_deterministically(tmp_path: Path)
             "step_gate",
             approval_id="apr_late",
             actor_id=ACTOR,
+            idempotency_key="platform_workflow_expired_decision",
             at=later,
         )
     record = _step_head(gate_root, gate_run.step_run_ids[0])
@@ -268,6 +359,7 @@ def test_approval_grant_continues_and_wrong_target_is_rejected(tmp_path: Path) -
             "step_gate",
             approval_id=wrong_target.approval_id,
             actor_id=ACTOR,
+            idempotency_key="platform_workflow_wrong_target_decision",
         )
     gate_unbound = store_approval(
         root,
@@ -282,6 +374,7 @@ def test_approval_grant_continues_and_wrong_target_is_rejected(tmp_path: Path) -
             "step_gate",
             approval_id=gate_unbound.approval_id,
             actor_id=ACTOR,
+            idempotency_key="platform_workflow_unbound_gate_decision",
         )
     issued_at = datetime.now(UTC)
     wrong_policy_version = ApprovalRecord.create(
@@ -309,6 +402,7 @@ def test_approval_grant_continues_and_wrong_target_is_rejected(tmp_path: Path) -
             "step_gate",
             approval_id=wrong_policy_version.approval_id,
             actor_id=ACTOR,
+            idempotency_key="platform_workflow_wrong_policy_decision",
         )
     approval = ApprovalAuthorityService(root).issue_approval(
         run.workflow_run_id,
@@ -317,7 +411,11 @@ def test_approval_grant_continues_and_wrong_target_is_rejected(tmp_path: Path) -
         idempotency_key="platform_workflow_grant",
     )
     service.grant_approval(
-        run.workflow_run_id, "step_gate", approval_id=approval.approval_id, actor_id=ACTOR
+        run.workflow_run_id,
+        "step_gate",
+        approval_id=approval.approval_id,
+        actor_id=ACTOR,
+        idempotency_key="platform_workflow_grant_decision",
     )
     gate_record = _step_head(root, run.step_run_ids[1])
     assert gate_record.state == "succeeded"
@@ -341,7 +439,12 @@ def test_deny_approval_fails_the_run(tmp_path: Path) -> None:
     )
     run = _start(service, revision)
     service.run_ready_steps(run.workflow_run_id)
-    denied = service.deny_approval(run.workflow_run_id, "step_gate", actor_id=ACTOR)
+    denied = service.deny_approval(
+        run.workflow_run_id,
+        "step_gate",
+        actor_id=ACTOR,
+        idempotency_key="platform_workflow_deny_decision",
+    )
     assert denied.state == "failed"
     record = _step_head(root, run.step_run_ids[0])
     assert record.state == "failed"
@@ -390,7 +493,11 @@ def test_crash_recovery_resumes_without_reexecuting_steps(tmp_path: Path) -> Non
         idempotency_key="platform_workflow_recovery",
     )
     recovered.grant_approval(
-        run.workflow_run_id, "step_gate", approval_id=approval.approval_id, actor_id=ACTOR
+        run.workflow_run_id,
+        "step_gate",
+        approval_id=approval.approval_id,
+        actor_id=ACTOR,
+        idempotency_key="platform_workflow_recovery_decision",
     )
     resumed = recovered.run_ready_steps(run.workflow_run_id)
     assert resumed.state == "succeeded"
@@ -479,7 +586,11 @@ def test_workflow_engine_disabled_fails_closed(tmp_path: Path) -> None:
         service.run_ready_steps("wrun_missing")
     with pytest.raises(WorkflowError, match="disabled"):
         service.grant_approval(
-            "wrun_missing", "step_gate", approval_id="apr_missing", actor_id=ACTOR
+            "wrun_missing",
+            "step_gate",
+            approval_id="apr_missing",
+            actor_id=ACTOR,
+            idempotency_key="platform_workflow_disabled_decision",
         )
     with pytest.raises(WorkflowError, match="disabled"):
         service.cancel("wrun_missing", actor_id=ACTOR)
@@ -505,3 +616,441 @@ def test_snapshot_exposes_graph_and_hides_raw_inputs(tmp_path: Path) -> None:
     assert graph[0]["edges"][0]["source_node_id"] == "step_a"
     assert all("inputs" not in payload for payload in snapshot["runs"])
     assert "raw input value" not in canonical_json_bytes(snapshot).decode("utf-8")
+
+
+@pytest.mark.parametrize("decision", ["grant", "deny"])
+def test_workflow_decision_crash_replay_returns_original_run_without_second_event(
+    tmp_path: Path, decision: str
+) -> None:
+    root = make_platform_workspace(tmp_path / decision)
+    service, run, approval = _waiting_approval(root, start_key=f"decision_crash_{decision}")
+    decision_key = f"decision_crash_replay_{decision}"
+    decided_at = DECISION_WAIT_STARTED + timedelta(seconds=2)
+
+    if decision == "grant":
+        first = service.grant_approval(
+            run.workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=decided_at,
+        )
+    else:
+        first = service.deny_approval(
+            run.workflow_run_id,
+            "step_gate",
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=decided_at,
+        )
+    assert type(first) is WorkflowRun
+    events_after_commit = _decision_events(root, run.workflow_run_id)
+    if decision == "grant":
+        assert first.state == "running"
+        assert service.run_ready_steps(run.workflow_run_id).state == "succeeded"
+
+    recovered = WorkflowService(root)
+    replay_at = DECISION_WAIT_STARTED + timedelta(days=1)
+    if decision == "grant":
+        replay = recovered.grant_approval(
+            run.workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=replay_at,
+        )
+    else:
+        replay = recovered.deny_approval(
+            run.workflow_run_id,
+            "step_gate",
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=replay_at,
+        )
+
+    assert replay == first
+    assert _decision_events(root, run.workflow_run_id) == events_after_commit
+    assert len(events_after_commit) == 1
+    assert _decision_receipt_count(root) == 1
+    if decision == "deny":
+        with initialize_platform_store(root) as store:
+            authority_record = store.head("authority_approval", approval.approval_id)
+        assert authority_record is not None
+        assert authority_record.state == "accepted"
+        assert authority_record.revision == 1
+
+
+@pytest.mark.parametrize("decision", ["grant", "deny"])
+def test_concurrent_exact_workflow_decisions_commit_one_transition_and_receipt(
+    tmp_path: Path, decision: str
+) -> None:
+    root = make_platform_workspace(tmp_path / decision)
+    _, run, approval = _waiting_approval(root, start_key=f"decision_concurrent_{decision}")
+
+    def _decide(_: int) -> WorkflowRun:
+        service = WorkflowService(root)
+        if decision == "grant":
+            return service.grant_approval(
+                run.workflow_run_id,
+                "step_gate",
+                approval_id=approval.approval_id,
+                actor_id=ACTOR,
+                idempotency_key=f"decision_concurrent_exact_{decision}",
+                at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+            )
+        return service.deny_approval(
+            run.workflow_run_id,
+            "step_gate",
+            actor_id=ACTOR,
+            idempotency_key=f"decision_concurrent_exact_{decision}",
+            at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = tuple(executor.map(_decide, range(16)))
+
+    assert all(result == results[0] for result in results)
+    assert len(_decision_events(root, run.workflow_run_id)) == 1
+    assert _decision_receipt_count(root) == 1
+
+
+def test_workflow_decision_key_cannot_rebind_or_manufacture_terminal_success(
+    tmp_path: Path,
+) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, run, approval = _waiting_approval(root, start_key="decision_binding")
+    decision_key = "decision_binding_exact"
+    service.grant_approval(
+        run.workflow_run_id,
+        "step_gate",
+        approval_id=approval.approval_id,
+        actor_id=ACTOR,
+        idempotency_key=decision_key,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+    )
+
+    with pytest.raises(WorkflowError, match="idempotency"):
+        service.grant_approval(
+            run.workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id="user_other_actor",
+            idempotency_key=decision_key,
+            at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+        )
+    with pytest.raises(WorkflowError, match="idempotency"):
+        service.grant_approval(
+            run.workflow_run_id,
+            "step_gate",
+            approval_id="apr_changed",
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+        )
+    with pytest.raises(WorkflowError, match="idempotency"):
+        service.deny_approval(
+            run.workflow_run_id,
+            "step_gate",
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+        )
+    with pytest.raises(WorkflowError, match="waiting"):
+        service.grant_approval(
+            run.workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            idempotency_key="decision_binding_changed_key",
+            at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+        )
+
+    _, other_run, other_approval = _waiting_approval(
+        root,
+        start_key="decision_binding_other_run",
+        inputs={"seed": "other"},
+    )
+    with pytest.raises(WorkflowError, match="idempotency"):
+        service.grant_approval(
+            other_run.workflow_run_id,
+            "step_gate",
+            approval_id=other_approval.approval_id,
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+        )
+    with pytest.raises(WorkflowError, match="node"):
+        service.grant_approval(
+            run.workflow_run_id,
+            "step_other",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+        )
+
+    assert len(_decision_events(root, run.workflow_run_id)) == 1
+    assert _decision_receipt_count(root) == 1
+    assert _step_head(root, other_run.step_run_ids[0]).state == "waiting"
+
+
+@pytest.mark.parametrize(
+    "changed_binding",
+    [
+        "run_input",
+        "step_id",
+        "gate_id",
+        "gate_action",
+        "gate_role",
+        "policy_sha256",
+        "policy_version",
+        "gate_expiry",
+    ],
+)
+def test_workflow_decision_replay_rejects_changed_persisted_binding(
+    tmp_path: Path, changed_binding: str
+) -> None:
+    root = make_platform_workspace(tmp_path / changed_binding)
+    service, run, approval = _waiting_approval(
+        root, start_key=f"decision_persisted_{changed_binding}"
+    )
+    decision_key = f"decision_persisted_replay_{changed_binding}"
+    service.grant_approval(
+        run.workflow_run_id,
+        "step_gate",
+        approval_id=approval.approval_id,
+        actor_id=ACTOR,
+        idempotency_key=decision_key,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+    )
+
+    if changed_binding == "run_input":
+        with initialize_platform_store(root) as store:
+            record = store.head("workflow_run", run.workflow_run_id)
+            assert record is not None
+            payload = dict(record.payload)
+        payload["inputs"] = {"seed": "changed"}
+        _rewrite_head_payload(root, "workflow_run", run.workflow_run_id, payload)
+    elif changed_binding == "step_id":
+        with initialize_platform_store(root) as store:
+            record = store.head("workflow_step", run.step_run_ids[0])
+            assert record is not None
+            payload = dict(record.payload)
+        payload["step_run_id"] = "wstep_changed_binding"
+        _rewrite_head_payload(root, "workflow_step", run.step_run_ids[0], payload)
+    else:
+        with initialize_platform_store(root) as store:
+            record = store.head("workflow_approval_gate", GATE.approval_gate_id)
+            assert record is not None
+            payload = dict(record.payload)
+        updates: dict[str, Any] = {
+            "gate_id": {"approval_gate_id": "wgate_changed_binding"},
+            "gate_action": {"action": "workflow_other_action"},
+            "gate_role": {"required_role": "role_reviewer"},
+            "policy_sha256": {"scope_sha256": "d" * 64},
+            "policy_version": {"schema_version": "1.5.0"},
+            "gate_expiry": {"expires_after_seconds": GATE.expires_after_seconds + 1},
+        }[changed_binding]
+        payload.update(updates)
+        _rewrite_head_payload(
+            root,
+            "workflow_approval_gate",
+            GATE.approval_gate_id,
+            payload,
+        )
+
+    with pytest.raises(WorkflowError, match=r"binding|gate|idempotency|receipt"):
+        WorkflowService(root).grant_approval(
+            run.workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+        )
+
+    assert len(_decision_events(root, run.workflow_run_id)) == 1
+
+
+@pytest.mark.parametrize("corruption", ["receipt", "event", "missing_receipt"])
+def test_workflow_decision_replay_fails_closed_on_orphan_or_corruption(
+    tmp_path: Path, corruption: str
+) -> None:
+    root = make_platform_workspace(tmp_path / corruption)
+    service, run, approval = _waiting_approval(root, start_key=f"decision_{corruption}")
+    decision_key = f"decision_corruption_{corruption}"
+    service.grant_approval(
+        run.workflow_run_id,
+        "step_gate",
+        approval_id=approval.approval_id,
+        actor_id=ACTOR,
+        idempotency_key=decision_key,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+    )
+    with initialize_platform_store(root) as store, store.transaction():
+        if corruption == "receipt":
+            store.connection.execute(
+                "UPDATE idempotency_receipts SET receipt_json='{}' "
+                "WHERE scope='workflow_approval_decision' AND idempotency_key=?",
+                (decision_key,),
+            )
+        elif corruption == "event":
+            store.connection.execute(
+                "DELETE FROM audit_events WHERE stream_id=? "
+                "AND event_type='workflow_approval_granted'",
+                (run.workflow_run_id,),
+            )
+        else:
+            store.connection.execute(
+                "DELETE FROM idempotency_receipts "
+                "WHERE scope='workflow_approval_decision' AND idempotency_key=?",
+                (decision_key,),
+            )
+
+    error = "waiting" if corruption == "missing_receipt" else "receipt"
+    with pytest.raises(WorkflowError, match=error):
+        WorkflowService(root).grant_approval(
+            run.workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+        )
+
+
+@pytest.mark.parametrize("decision", ["grant", "deny"])
+def test_workflow_decision_receipt_event_and_transition_roll_back_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+) -> None:
+    root = make_platform_workspace(tmp_path / decision)
+    service, run, approval = _waiting_approval(root, start_key=f"decision_rollback_{decision}")
+    original = PlatformStore.idempotent_receipt
+
+    class SimulatedCrash(RuntimeError):
+        pass
+
+    def _crash_after_receipt(
+        self: PlatformStore,
+        *,
+        scope: str,
+        idempotency_key: str,
+        request: dict[str, Any],
+        receipt: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        result = original(
+            self,
+            scope=scope,
+            idempotency_key=idempotency_key,
+            request=request,
+            receipt=receipt,
+        )
+        if scope == "workflow_approval_decision" and receipt is not None:
+            raise SimulatedCrash("crash after decision receipt")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PlatformStore, "idempotent_receipt", _crash_after_receipt)
+        with pytest.raises(SimulatedCrash):
+            if decision == "grant":
+                service.grant_approval(
+                    run.workflow_run_id,
+                    "step_gate",
+                    approval_id=approval.approval_id,
+                    actor_id=ACTOR,
+                    idempotency_key=f"decision_rollback_exact_{decision}",
+                    at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+                )
+            else:
+                service.deny_approval(
+                    run.workflow_run_id,
+                    "step_gate",
+                    actor_id=ACTOR,
+                    idempotency_key=f"decision_rollback_exact_{decision}",
+                    at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+                )
+
+    step = _step_head(root, run.step_run_ids[0])
+    assert step.state == "waiting"
+    assert WorkflowService(root).snapshot()["runs"][0]["state"] == "running"
+    assert _decision_events(root, run.workflow_run_id) == ()
+    assert _decision_receipt_count(root) == 0
+
+
+def test_deny_default_time_is_sampled_after_writer_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, revision = _registered(
+        root,
+        (
+            _node(
+                "step_gate",
+                WorkflowNodeType.APPROVAL,
+                approval_gate_id=GATE.approval_gate_id,
+            ),
+        ),
+        (),
+        approval_gates=(GATE,),
+    )
+    run = _start(service, revision)
+    service.run_ready_steps(run.workflow_run_id)
+    transaction_attempted = Event()
+    test_thread = get_ident()
+    original_transaction = PlatformStore.transaction
+
+    @contextmanager
+    def _observed_transaction(self: PlatformStore) -> Any:
+        if get_ident() != test_thread:
+            transaction_attempted.set()
+        with original_transaction(self):
+            yield
+
+    monkeypatch.setattr(PlatformStore, "transaction", _observed_transaction)
+    with ThreadPoolExecutor(max_workers=1) as executor, initialize_platform_store(
+        root
+    ) as blocker:
+        with blocker.transaction():
+            result = executor.submit(
+                service.deny_approval,
+                run.workflow_run_id,
+                "step_gate",
+                actor_id=ACTOR,
+                idempotency_key="decision_deny_lock_time",
+            )
+            assert transaction_attempted.wait(timeout=1)
+            time.sleep(0.05)
+            release_boundary = datetime.now(UTC)
+        denied = result.result(timeout=5)
+
+    assert denied.completed_at is not None
+    assert denied.completed_at >= release_boundary
+
+
+@pytest.mark.parametrize("decision", ["grant", "deny"])
+def test_workflow_decisions_require_exact_nonempty_key_and_aware_time(
+    tmp_path: Path, decision: str
+) -> None:
+    root = make_platform_workspace(tmp_path / decision)
+    service, run, approval = _waiting_approval(root, start_key=f"decision_input_{decision}")
+    kwargs: dict[str, Any] = {
+        "actor_id": ACTOR,
+        "idempotency_key": "",
+        "at": datetime(2040, 2, 3, 4, 5, 8),
+    }
+    if decision == "grant":
+        kwargs["approval_id"] = approval.approval_id
+    operation = service.grant_approval if decision == "grant" else service.deny_approval
+
+    with pytest.raises(WorkflowError, match="idempotency"):
+        operation(run.workflow_run_id, "step_gate", **kwargs)
+    kwargs["idempotency_key"] = f"decision_input_exact_{decision}"
+    with pytest.raises(WorkflowError, match="timezone"):
+        operation(run.workflow_run_id, "step_gate", **kwargs)
+
+    assert _step_head(root, run.step_run_ids[0]).state == "waiting"
+    assert _decision_receipt_count(root) == 0

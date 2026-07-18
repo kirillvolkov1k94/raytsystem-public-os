@@ -530,6 +530,7 @@ def test_wrong_node_and_nonwaiting_step_fail_without_authority_record(tmp_path: 
         "step_gate",
         approval_id=approval.approval_id,
         actor_id=ACTOR,
+        idempotency_key="approval_authority_transition_decision",
         at=WAIT_STARTED + timedelta(seconds=11),
     )
     with pytest.raises(AuthorityError, match="waiting"):
@@ -677,6 +678,7 @@ def test_grant_rejects_approval_outside_exact_gate_authority(
             "step_gate",
             approval_id=approval.approval_id,
             actor_id=ACTOR,
+            idempotency_key=f"approval_authority_invalid_{invalid_binding}",
             at=WAIT_STARTED + timedelta(seconds=20),
         )
 
@@ -711,6 +713,7 @@ def test_grant_rejects_noncanonical_approval_record_head(tmp_path: Path, invalid
             "step_gate",
             approval_id=requested_id,
             actor_id=ACTOR,
+            idempotency_key=f"approval_authority_head_{invalid_head}",
             at=WAIT_STARTED + timedelta(seconds=20),
         )
 
@@ -738,6 +741,7 @@ def test_grant_rejects_noncanonical_approval_gate_head(
             "step_gate",
             approval_id=approval.approval_id,
             actor_id=ACTOR,
+            idempotency_key=f"approval_authority_gate_decision_{invalid_gate}",
             at=WAIT_STARTED + timedelta(seconds=20),
         )
 
@@ -778,6 +782,7 @@ def test_grant_rejects_explicit_time_without_utc_offset(
             "step_gate",
             approval_id=approval.approval_id,
             actor_id=ACTOR,
+            idempotency_key="approval_authority_invalid_time_decision",
             at=invalid_at,
         )
 
@@ -814,6 +819,7 @@ def test_grant_rejects_execution_approval_without_generic_fallback(
             "step_gate",
             approval_id=approval.approval_id,
             actor_id=ACTOR,
+            idempotency_key="approval_authority_execution_decision",
             at=WAIT_STARTED + timedelta(seconds=20),
         )
 
@@ -841,6 +847,7 @@ def test_grant_rejects_file_only_approval_fallback(tmp_path: Path) -> None:
             "step_gate",
             approval_id=approval.approval_id,
             actor_id=ACTOR,
+            idempotency_key="approval_authority_file_decision",
             at=WAIT_STARTED + timedelta(seconds=20),
         )
 
@@ -901,6 +908,7 @@ def test_grant_preserves_emergency_revocation_in_locked_snapshot(
             "step_gate",
             approval_id=approval.approval_id,
             actor_id=ACTOR,
+            idempotency_key="approval_authority_revoked_decision",
         )
 
     assert observed_locked_store is True
@@ -954,6 +962,7 @@ def test_grant_default_time_is_sampled_after_writer_lock_before_expiry_check(
                 "step_gate",
                 approval_id=approval.approval_id,
                 actor_id=ACTOR,
+                idempotency_key="approval_authority_lock_decision",
             )
             assert transaction_attempted.wait(timeout=1)
             time.sleep(1.2)

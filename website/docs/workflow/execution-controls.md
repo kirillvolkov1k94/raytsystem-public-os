@@ -6,7 +6,7 @@ status: experimental
 feature_flags: [workflow_engine_enabled, runtime_execution_enabled, heartbeats_enabled, notifications_enabled, external_notifications_enabled, emergency_controls_enabled]
 related_commands:
   - "uv run raytsystem workflow list --json"
-  - "uv run raytsystem workflow approve ..."
+  - "uv run raytsystem workflow approve ... --idempotency-key <key>"
   - "uv run raytsystem workflow cancel ..."
 related_pages:
   - /workflow/overview
@@ -49,7 +49,8 @@ uv run raytsystem workflow list --json
 Согласование гейта и отмена запуска:
 
 ```bash
-uv run raytsystem workflow approve ...
+uv run raytsystem workflow approve <run_id> <node_id> \
+  --approval-id <approval_id> --idempotency-key <stable_retry_key>
 uv run raytsystem workflow cancel ...
 ```
 
@@ -66,6 +67,12 @@ uv run raytsystem notifications list --json
 Состояния запуска (`WorkflowRun.state`): `planned`, `running`, `paused`, `cancelled`, `succeeded`, `failed`. Состояния шага (`WorkflowStepRun.state`): `pending`, `running`, `waiting`, `paused`, `skipped`, `succeeded`, `failed`, `cancelled` (`src/raytsystem/contracts/workflows.py`).
 
 Тот же ключ идемпотентности не может создать второй запуск. При падении `run_ready_steps` пересчитывает готовность из durable-записей и возобновляет ровно с последнего зафиксированного шага — это воспроизведение записей, а не эвристика согласования (`ADR-029`). Узлы `wait` продвигаются ручным сигналом `wake` с той же дисциплиной timeout.
+
+Grant и deny approval-шага также требуют стабильный idempotency key. Переход, audit event и
+receipt коммитятся вместе; после потери ответа повторяйте точный запрос с тем же ключом. Exact
+replay возвращает исходный `WorkflowRun` без второго события. Новый ключ после terminal-перехода
+не считается доказательством успеха, а изменение actor, approval ID, входа или gate binding
+отклоняется.
 
 ## Артефакты и уведомления
 
@@ -90,6 +97,8 @@ uv run raytsystem notifications list --json
 
 - Ожидать, что `workflow list` покажет живое выполнение агентов — при выключенных runtime-флагах агентские узлы ждут. См. [Workflow заблокирован](/troubleshooting/workflow-blocked).
 - Пытаться отправить уведомление наружу — `external_notifications_enabled = false`, allowlist назначений пуст.
+- Генерировать новый `--idempotency-key` после тайм-аута approve — повтор должен использовать
+  тот же стабильный ключ и те же параметры.
 
 ## Связанные страницы
 
