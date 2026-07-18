@@ -44,6 +44,36 @@ _STEP_EXTRA_KEYS = frozenset({"output", "failure_reason"})
 _APPROVAL_DECISION_SCOPE = "workflow_approval_decision"
 
 
+class _WorkflowRunProjection(BaseModel):
+    """Typed immutable identity of a run across legitimate state progression."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_name: Literal["WorkflowRunV1"]
+    schema_version: str
+    id_scheme_version: str
+    extensions: dict[str, Any]
+    workflow_run_id: str
+    revision_id: str
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    step_run_ids: tuple[str, ...]
+    replay_of_run_id: str | None
+    started_at: datetime
+
+    @model_validator(mode="after")
+    def _valid_workflow_run_projection(self) -> _WorkflowRunProjection:
+        WorkflowRun.model_validate(
+            self.model_dump(mode="python") | {"state": "running", "completed_at": None}
+        )
+        return self
+
+    @classmethod
+    def from_run(cls, run: WorkflowRun) -> _WorkflowRunProjection:
+        return cls.model_validate(
+            run.model_dump(mode="python", exclude={"state", "completed_at"})
+        )
+
+
 class _WorkflowDecisionReceipt(BaseModel):
     """Immutable internal proof for one exact workflow approval transition."""
 
@@ -65,6 +95,7 @@ class _WorkflowDecisionReceipt(BaseModel):
     policy_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     policy_version: str
     gate_expires_at: datetime
+    run_projection: _WorkflowRunProjection
     decided_at: datetime
     event_id: str
     terminal_step_state: Literal["succeeded", "failed"]
@@ -82,6 +113,7 @@ class _WorkflowDecisionReceipt(BaseModel):
             or self.decided_at.tzinfo is None
             or self.decided_at.utcoffset() is None
             or self.result.workflow_run_id != self.workflow_run_id
+            or _WorkflowRunProjection.from_run(self.result) != self.run_projection
         ):
             raise ValueError("Workflow decision receipt binding is invalid")
         expected_state = "succeeded" if self.decision == "grant" else "failed"
@@ -112,6 +144,7 @@ class _WorkflowDecisionReceipt(BaseModel):
             "policy_sha256": self.policy_sha256,
             "policy_version": self.policy_version,
             "gate_expires_at": self.gate_expires_at,
+            "run_projection": self.run_projection.model_dump(mode="python"),
         }
 
     def identity_payload(self) -> dict[str, Any]:
@@ -1069,6 +1102,9 @@ class WorkflowService:
             "policy_sha256": context.gate.scope_sha256,
             "policy_version": context.gate.schema_version,
             "gate_expires_at": context.gate_expires_at,
+            "run_projection": _WorkflowRunProjection.from_run(context.run).model_dump(
+                mode="python"
+            ),
         }
 
     def _workflow_decision_receipt(
@@ -1131,6 +1167,7 @@ class WorkflowService:
             policy_sha256=context.gate.scope_sha256,
             policy_version=context.gate.schema_version,
             gate_expires_at=context.gate_expires_at,
+            run_projection=request["run_projection"],
             decided_at=decided_at,
             event_id=event_id,
             terminal_step_state=terminal_step_state,
@@ -1161,6 +1198,8 @@ class WorkflowService:
         receipt: _WorkflowDecisionReceipt,
     ) -> WorkflowRun:
         try:
+            if _WorkflowRunProjection.from_run(context.run) != receipt.run_projection:
+                raise WorkflowError("Workflow approval decision run binding is invalid")
             historical_run = store.record(
                 "workflow_run", receipt.workflow_run_id, receipt.run_revision
             )
