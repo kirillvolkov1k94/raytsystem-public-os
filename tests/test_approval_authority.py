@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from threading import Event, get_ident
 from typing import Any
@@ -13,8 +14,9 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+import raytsystem.authority as authority_module
 from platform_helpers import make_platform_workspace
-from raytsystem.authority import AuthorityError
+from raytsystem.authority import AuthorityError, AuthorityResolver
 from raytsystem.contracts import (
     ApprovalRecord,
     PendingWorkflowApproval,
@@ -26,13 +28,18 @@ from raytsystem.contracts import (
     derive_id,
     sha256_hex,
 )
+from raytsystem.contracts.execution import ExecutionApproval
+from raytsystem.contracts.governance import EmergencyAction
 from raytsystem.contracts.workflows import WorkflowNodeType
+from raytsystem.emergency import EmergencyService
+from raytsystem.execution.store import ExecutionStore
 from raytsystem.platform_store import (
     PlatformStore,
+    StoredRecord,
     initialize_platform_store,
     open_platform_store_read_only,
 )
-from raytsystem.workflows import ApprovalAuthorityService, WorkflowService
+from raytsystem.workflows import ApprovalAuthorityService, WorkflowError, WorkflowService
 
 pytestmark = pytest.mark.filterwarnings("error")
 
@@ -130,6 +137,74 @@ def _receipt_count(root: Path) -> int:
         ).fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _forged_workflow_approval(
+    workflow_run_id: str,
+    *,
+    approved_at: datetime = WAIT_STARTED + timedelta(seconds=10),
+    expires_at: datetime = WAIT_STARTED + timedelta(seconds=GATE.expires_after_seconds),
+    scope: tuple[str, ...] = (GATE.required_role,),
+    policy_version: str = GATE.schema_version,
+    policy_sha256: str = GATE.scope_sha256,
+    conditions: tuple[str, ...] = (),
+) -> ApprovalRecord:
+    return ApprovalRecord.create(
+        action=GATE.action,
+        target_id=derive_id("wfappr", {"node_id": "step_gate", "workflow_run_id": workflow_run_id}),
+        artifact_sha256=sha256_hex(canonical_json_bytes({"seed": "value"})),
+        scope=scope,
+        policy_version=policy_version,
+        policy_sha256=policy_sha256,
+        approver=APPROVER,
+        approved_at=approved_at,
+        expires_at=expires_at,
+        conditions=conditions,
+    )
+
+
+def _store_authority_approval(
+    root: Path,
+    approval: ApprovalRecord,
+    *,
+    record_id: str | None = None,
+    state: str = "accepted",
+    revisions: int = 1,
+) -> str:
+    stored_id = record_id or approval.approval_id
+    with initialize_platform_store(root) as store:
+        expected_revision: int | None = None
+        for revision in range(revisions):
+            store.append_record(
+                kind="authority_approval",
+                record_id=stored_id,
+                payload=approval.model_dump(mode="json"),
+                state=state,
+                expected_revision=expected_revision,
+            )
+            expected_revision = revision + 1
+    return stored_id
+
+
+def _step_head(root: Path, workflow_run_id: str) -> StoredRecord:
+    with initialize_platform_store(root) as store:
+        record = store.head(
+            "workflow_step",
+            derive_id("wstep", {"workflow_run_id": workflow_run_id, "node_id": "step_gate"}),
+        )
+    assert record is not None
+    return record
+
+
+class _NoOffsetTimezone(tzinfo):
+    def utcoffset(self, _value: datetime | None) -> None:
+        return None
+
+    def dst(self, _value: datetime | None) -> None:
+        return None
+
+    def tzname(self, _value: datetime | None) -> str:
+        return "no-offset"
 
 
 def test_inspect_pending_returns_exact_immutable_trusted_binding(tmp_path: Path) -> None:
@@ -497,6 +572,331 @@ def test_crash_rolls_back_approval_and_both_bindings(
     assert approval.approved_at == WAIT_STARTED + timedelta(seconds=11)
     assert _approval_count(root) == 1
     assert _receipt_count(root) == 2
+
+
+@pytest.mark.parametrize(
+    "invalid_binding",
+    [
+        "pre_wait",
+        "wrong_role",
+        "extra_role",
+        "wrong_policy_version",
+        "wrong_policy_sha256",
+        "shortened_expiry",
+        "extended_expiry",
+        "condition",
+    ],
+)
+def test_grant_rejects_approval_outside_exact_gate_authority(
+    tmp_path: Path, invalid_binding: str
+) -> None:
+    root = make_platform_workspace(tmp_path / invalid_binding)
+    service, workflow_run_id = _start_waiting(root)
+    approved_at = WAIT_STARTED + timedelta(seconds=10)
+    expires_at = WAIT_STARTED + timedelta(seconds=GATE.expires_after_seconds)
+    scope = (GATE.required_role,)
+    policy_version = GATE.schema_version
+    policy_sha256 = GATE.scope_sha256
+    conditions: tuple[str, ...] = ()
+    if invalid_binding == "pre_wait":
+        approved_at = WAIT_STARTED - timedelta(seconds=1)
+    elif invalid_binding == "wrong_role":
+        scope = ("role_admin",)
+    elif invalid_binding == "extra_role":
+        scope = (GATE.required_role, "role_admin")
+    elif invalid_binding == "wrong_policy_version":
+        policy_version = "0.9.0"
+    elif invalid_binding == "wrong_policy_sha256":
+        policy_sha256 = "d" * 64
+    elif invalid_binding == "shortened_expiry":
+        expires_at -= timedelta(seconds=1)
+    elif invalid_binding == "extended_expiry":
+        expires_at += timedelta(seconds=1)
+    else:
+        conditions = ("manual_follow_up",)
+    approval = _forged_workflow_approval(
+        workflow_run_id,
+        approved_at=approved_at,
+        expires_at=expires_at,
+        scope=scope,
+        policy_version=policy_version,
+        policy_sha256=policy_sha256,
+        conditions=conditions,
+    )
+    _store_authority_approval(root, approval)
+
+    with pytest.raises(WorkflowError, match="authority"):
+        service.grant_approval(
+            workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            at=WAIT_STARTED + timedelta(seconds=20),
+        )
+
+    assert _step_head(root, workflow_run_id).state == "waiting"
+
+
+@pytest.mark.parametrize("invalid_head", ["alias", "rejected", "revision"])
+def test_grant_rejects_noncanonical_approval_record_head(tmp_path: Path, invalid_head: str) -> None:
+    root = make_platform_workspace(tmp_path / invalid_head)
+    service, workflow_run_id = _start_waiting(root)
+    approval = _forged_workflow_approval(workflow_run_id)
+    record_id = approval.approval_id
+    state = "accepted"
+    revisions = 1
+    if invalid_head == "alias":
+        record_id = "apr_authority_alias"
+    elif invalid_head == "rejected":
+        state = "rejected"
+    else:
+        revisions = 2
+    requested_id = _store_authority_approval(
+        root,
+        approval,
+        record_id=record_id,
+        state=state,
+        revisions=revisions,
+    )
+
+    with pytest.raises(WorkflowError, match="authority"):
+        service.grant_approval(
+            workflow_run_id,
+            "step_gate",
+            approval_id=requested_id,
+            actor_id=ACTOR,
+            at=WAIT_STARTED + timedelta(seconds=20),
+        )
+
+    assert _step_head(root, workflow_run_id).state == "waiting"
+
+
+@pytest.mark.parametrize(
+    "invalid_at",
+    [
+        datetime(2040, 1, 2, 10, 4, 25),
+        datetime(2040, 1, 2, 10, 4, 25, tzinfo=_NoOffsetTimezone()),
+    ],
+)
+def test_grant_rejects_explicit_time_without_utc_offset(
+    tmp_path: Path, invalid_at: datetime
+) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, workflow_run_id = _start_waiting(root)
+    approval = ApprovalAuthorityService(root).issue_approval(
+        workflow_run_id,
+        "step_gate",
+        approver=APPROVER,
+        idempotency_key="approval_authority_grant_time",
+        at=WAIT_STARTED + timedelta(seconds=10),
+    )
+
+    with pytest.raises(WorkflowError, match="timezone"):
+        service.grant_approval(
+            workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            at=invalid_at,
+        )
+
+    assert _step_head(root, workflow_run_id).state == "waiting"
+
+
+def test_grant_rejects_execution_approval_without_generic_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, workflow_run_id = _start_waiting(root)
+    seed = ExecutionApproval(
+        approval_id="xapr_pending",
+        action=GATE.action,
+        payload_sha256=sha256_hex(canonical_json_bytes({"seed": "value"})),
+        run_id=derive_id("wfappr", {"node_id": "step_gate", "workflow_run_id": workflow_run_id}),
+        scope=(GATE.required_role,),
+        approved_by=APPROVER,
+        approved_at=WAIT_STARTED + timedelta(seconds=10),
+        expires_at=WAIT_STARTED + timedelta(seconds=GATE.expires_after_seconds),
+    )
+    approval = seed.model_copy(update={"approval_id": derive_id("xapr", seed.identity_payload())})
+    with ExecutionStore.open_for_write(root / "ops" / "control.sqlite") as store:
+        store.put(approval, expected_revision=None)
+
+    def _generic_fallback_forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("workflow grant consulted the generic authority fallback")
+
+    monkeypatch.setattr(AuthorityResolver, "require_approval", _generic_fallback_forbidden)
+
+    with pytest.raises(WorkflowError, match="authority"):
+        service.grant_approval(
+            workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            at=WAIT_STARTED + timedelta(seconds=20),
+        )
+
+    assert _step_head(root, workflow_run_id).state == "waiting"
+
+
+def test_grant_rejects_file_only_approval_fallback(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, workflow_run_id = _start_waiting(root)
+    approval = _forged_workflow_approval(workflow_run_id)
+    accepted = root / "ops" / "approvals" / "accepted"
+    accepted.mkdir(parents=True, exist_ok=True)
+    (accepted / f"{approval.approval_id}.json").write_text(
+        json.dumps(approval.model_dump(mode="json"), sort_keys=True),
+        encoding="utf-8",
+    )
+    (accepted / f"{approval.approval_id}.verification.json").write_text(
+        json.dumps({"approval_id": approval.approval_id}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(WorkflowError, match="authority"):
+        service.grant_approval(
+            workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+            at=WAIT_STARTED + timedelta(seconds=20),
+        )
+
+    assert _step_head(root, workflow_run_id).state == "waiting"
+
+
+def test_grant_preserves_emergency_revocation_in_locked_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, revision = _register(root)
+    run = service.start(
+        revision.revision_id,
+        {"seed": "value"},
+        actor_id=ACTOR,
+        idempotency_key="workflow_authority_revoked_grant",
+    )
+    service.run_ready_steps(run.workflow_run_id, at=datetime.now(UTC))
+    approval = ApprovalAuthorityService(root).issue_approval(
+        run.workflow_run_id,
+        "step_gate",
+        approver=APPROVER,
+        idempotency_key="approval_authority_revoked_grant",
+    )
+    time.sleep(0.002)
+    EmergencyService(root).activate(
+        (EmergencyAction.REVOKE_PENDING_APPROVALS,),
+        reason="approval provenance incident",
+        actor_id=ACTOR,
+        idempotency_key="emergency_revoke_workflow_approval",
+    )
+    original = AuthorityResolver.require_workflow_approval
+    observed_locked_store = False
+
+    def _observe_locked_store(
+        self: AuthorityResolver,
+        store: PlatformStore,
+        approval_id: str,
+        **kwargs: Any,
+    ) -> ApprovalRecord:
+        nonlocal observed_locked_store
+        observed_locked_store = store.connection.in_transaction
+        return original(self, store, approval_id, **kwargs)
+
+    def _read_only_authority_forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("workflow grant opened a second authority snapshot")
+
+    monkeypatch.setattr(AuthorityResolver, "require_workflow_approval", _observe_locked_store)
+    monkeypatch.setattr(
+        authority_module,
+        "open_platform_store_read_only",
+        _read_only_authority_forbidden,
+    )
+
+    with pytest.raises(WorkflowError, match="authority"):
+        service.grant_approval(
+            run.workflow_run_id,
+            "step_gate",
+            approval_id=approval.approval_id,
+            actor_id=ACTOR,
+        )
+
+    assert observed_locked_store is True
+    assert _step_head(root, run.workflow_run_id).state == "waiting"
+
+
+def test_grant_default_time_is_sampled_after_writer_lock_before_expiry_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_platform_workspace(tmp_path)
+    short_gate = GATE.model_copy(
+        update={
+            "approval_gate_id": "wgate_authority_grant_lock",
+            "expires_after_seconds": 1,
+        }
+    )
+    service, revision = _register(root, short_gate)
+    run = service.start(
+        revision.revision_id,
+        {"seed": "value"},
+        actor_id=ACTOR,
+        idempotency_key="workflow_authority_grant_lock",
+    )
+    service.run_ready_steps(run.workflow_run_id, at=datetime.now(UTC))
+    approval = ApprovalAuthorityService(root).issue_approval(
+        run.workflow_run_id,
+        "step_gate",
+        approver=APPROVER,
+        idempotency_key="approval_authority_grant_lock",
+    )
+    transaction_attempted = Event()
+    test_thread = get_ident()
+    original_transaction = PlatformStore.transaction
+
+    @contextmanager
+    def _observed_transaction(self: PlatformStore) -> Any:
+        if get_ident() != test_thread:
+            transaction_attempted.set()
+        with original_transaction(self):
+            yield
+
+    monkeypatch.setattr(PlatformStore, "transaction", _observed_transaction)
+
+    with ThreadPoolExecutor(max_workers=1) as executor, initialize_platform_store(
+        root
+    ) as blocker:
+        with blocker.transaction():
+            result = executor.submit(
+                service.grant_approval,
+                run.workflow_run_id,
+                "step_gate",
+                approval_id=approval.approval_id,
+                actor_id=ACTOR,
+            )
+            assert transaction_attempted.wait(timeout=1)
+            time.sleep(1.2)
+        with pytest.raises(WorkflowError, match="expired"):
+            result.result(timeout=5)
+
+    record = _step_head(root, run.workflow_run_id)
+    assert record.state == "failed"
+    assert record.payload["failure_reason"] == "approval_expired"
+    assert record.payload.get("approval_id") is None
+    assert "output" not in record.payload
+    with initialize_platform_store(root) as store:
+        step_states = tuple(
+            str(row[0])
+            for row in store.connection.execute(
+                "SELECT state FROM records WHERE kind='workflow_step' AND record_id=?",
+                (record.record_id,),
+            ).fetchall()
+        )
+        event_types = tuple(
+            event["event_type"] for event in store.list_events(run.workflow_run_id)
+        )
+    assert "succeeded" not in step_states
+    assert "workflow_approval_granted" not in event_types
 
 
 @pytest.mark.parametrize("operation", ["inspect", "issue"])

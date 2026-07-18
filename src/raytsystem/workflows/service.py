@@ -10,7 +10,6 @@ from pydantic import ValidationError
 
 from raytsystem.authority import AuthorityError, AuthorityResolver, workflow_approval_target
 from raytsystem.contracts import (
-    ApprovalRecord,
     WorkflowApprovalGate,
     WorkflowDefinition,
     WorkflowNode,
@@ -372,57 +371,76 @@ class WorkflowService:
         EmergencyService(self.root, features=self.features).assert_runtime_allowed()
         if not approval_id:
             raise WorkflowError("Workflow approval requires an explicit approval ID")
-        now = (at or datetime.now(UTC)).astimezone(UTC)
-        with initialize_platform_store(self.root) as store:
+        requested_at: datetime | None = None
+        if at is not None:
+            try:
+                if at.tzinfo is None or at.utcoffset() is None:
+                    raise WorkflowError("Workflow approval time must be timezone-aware")
+                requested_at = at.astimezone(UTC)
+            except (TypeError, ValueError) as error:
+                raise WorkflowError("Workflow approval time must be timezone-aware") from error
+        expired = False
+        granted_run: WorkflowRun | None = None
+        with initialize_platform_store(self.root) as store, store.transaction():
+            now = requested_at or datetime.now(UTC)
             run, _, _ = self._load_run(store, workflow_run_id, expected_state="running")
             node, step, record = self._waiting_step(
                 store, run, node_id, expected=WorkflowNodeType.APPROVAL
             )
             gate = self._approval_gate(store, node)
-            deadline = timedelta(seconds=gate.expires_after_seconds)
-            if step.started_at is not None and now >= step.started_at + deadline:
-                expired = step.model_copy(update={"state": "failed", "completed_at": now})
+            if step.started_at is None:
+                raise WorkflowError("Workflow approval waiting time is invalid")
+            gate_expires_at = step.started_at + timedelta(seconds=gate.expires_after_seconds)
+            if now >= gate_expires_at:
+                failed = step.model_copy(update={"state": "failed", "completed_at": now})
                 self._persist_step(
-                    store, expired, record.revision, extra={"failure_reason": "approval_expired"}
+                    store,
+                    failed,
+                    record.revision,
+                    extra={"failure_reason": "approval_expired"},
                 )
-                raise WorkflowError("Workflow approval gate has expired")
-            try:
-                approval = AuthorityResolver(self.root).require_approval(
-                    approval_id,
-                    action=_APPROVAL_ACTION,
-                    target_id=workflow_approval_target(workflow_run_id, node_id),
-                    artifact_sha256=run.input_sha256,
-                    required_scope=frozenset({gate.required_role}),
-                    policy_sha256=gate.scope_sha256,
-                    at=now,
+                expired = True
+            else:
+                try:
+                    approval = AuthorityResolver(self.root).require_workflow_approval(
+                        store,
+                        approval_id,
+                        target_id=workflow_approval_target(workflow_run_id, node_id),
+                        artifact_sha256=run.input_sha256,
+                        required_role=gate.required_role,
+                        policy_version=gate.schema_version,
+                        policy_sha256=gate.scope_sha256,
+                        waiting_since=step.started_at,
+                        gate_expires_at=gate_expires_at,
+                        at=now,
+                    )
+                except AuthorityError as error:
+                    raise WorkflowError("Workflow approval authority is invalid") from error
+                output = {"approval_id": approval.approval_id, "granted_by": actor_id}
+                output_bytes = self._safe_payload(output, label="Workflow output")
+                granted = step.model_copy(
+                    update={
+                        "state": "succeeded",
+                        "approval_id": approval.approval_id,
+                        "output_sha256": sha256_hex(output_bytes),
+                        "completed_at": now,
+                    }
                 )
-                if (
-                    not isinstance(approval, ApprovalRecord)
-                    or approval.policy_version != gate.schema_version
-                ):
-                    raise AuthorityError("Workflow approval policy version is invalid")
-            except AuthorityError as error:
-                raise WorkflowError("Workflow approval authority is invalid") from error
-            output = {"approval_id": approval_id, "granted_by": actor_id}
-            output_bytes = self._safe_payload(output, label="Workflow output")
-            granted = step.model_copy(
-                update={
-                    "state": "succeeded",
-                    "approval_id": approval_id,
-                    "output_sha256": sha256_hex(output_bytes),
-                    "completed_at": now,
-                }
-            )
-            self._persist_step(store, granted, record.revision, extra={"output": output})
-            store.append_event(
-                stream_id=workflow_run_id,
-                aggregate_id=step.step_run_id,
-                event_type="workflow_approval_granted",
-                actor_id=actor_id,
-                payload_schema="workflow_step_run_v1",
-                payload={"node_id": node_id, "approval_id": approval_id},
-            )
-            return run
+                self._persist_step(store, granted, record.revision, extra={"output": output})
+                store.append_event(
+                    stream_id=workflow_run_id,
+                    aggregate_id=step.step_run_id,
+                    event_type="workflow_approval_granted",
+                    actor_id=actor_id,
+                    payload_schema="workflow_step_run_v1",
+                    payload={"node_id": node_id, "approval_id": approval.approval_id},
+                )
+                granted_run = run
+        if expired:
+            raise WorkflowError("Workflow approval gate has expired")
+        if granted_run is None:
+            raise WorkflowError("Workflow approval transition did not complete")
+        return granted_run
 
     def deny_approval(
         self,

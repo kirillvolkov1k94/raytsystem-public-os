@@ -378,6 +378,64 @@ class AuthorityResolver:
             raise AuthorityError("Approval was revoked by an active emergency control")
         return approval
 
+    def require_workflow_approval(
+        self,
+        store: PlatformStore,
+        approval_id: str,
+        *,
+        target_id: str,
+        artifact_sha256: str,
+        required_role: str,
+        policy_version: str,
+        policy_sha256: str,
+        waiting_since: datetime,
+        gate_expires_at: datetime,
+        at: datetime,
+    ) -> ApprovalRecord:
+        """Resolve one exact workflow approval from the caller's locked store snapshot."""
+
+        if store.root != self.root or not store.connection.in_transaction:
+            raise AuthorityError("Workflow approval requires a locked platform transaction")
+        try:
+            record = store.head("authority_approval", approval_id)
+        except (PlatformStoreError, TypeError, ValueError) as error:
+            raise AuthorityError("Workflow approval authority record is invalid") from error
+        if (
+            record is None
+            or record.kind != "authority_approval"
+            or record.record_id != approval_id
+            or record.revision != 1
+            or record.state != "accepted"
+        ):
+            raise AuthorityError("Workflow approval authority record is not canonical")
+        try:
+            approval = ApprovalRecord.model_validate(record.payload)
+            expected = ApprovalRecord.create(
+                action=_WORKFLOW_APPROVAL_ACTION,
+                target_id=target_id,
+                artifact_sha256=artifact_sha256,
+                scope=(required_role,),
+                policy_version=policy_version,
+                policy_sha256=policy_sha256,
+                approver=approval.approver,
+                approved_at=approval.approved_at,
+                expires_at=gate_expires_at,
+            )
+        except (ValidationError, TypeError, ValueError) as error:
+            raise AuthorityError("Stored workflow approval contract is invalid") from error
+        if (
+            approval != expected
+            or approval.approval_id != approval_id
+            or approval.approved_at < waiting_since
+            or approval.approved_at > at
+            or at >= gate_expires_at
+        ):
+            raise AuthorityError("Workflow approval does not match the exact gate authority")
+        revoked_after = self._pending_approvals_revoked_at(store)
+        if revoked_after is not None and approval.approved_at < revoked_after:
+            raise AuthorityError("Approval was revoked by an active emergency control")
+        return approval
+
     def require_policy_decision(
         self,
         policy_decision_id: str,
@@ -444,17 +502,21 @@ class AuthorityResolver:
             raise AuthorityError("Policy decision authority record is unavailable")
         return execution
 
-    def _pending_approvals_revoked_at(self) -> datetime | None:
-        store = open_platform_store_read_only(self.root)
+    def _pending_approvals_revoked_at(self, store: PlatformStore | None = None) -> datetime | None:
         if store is None:
-            return None
-        with store:
-            try:
-                record = store.head("emergency", "emergency_global")
-            except (PlatformStoreError, sqlite3.Error) as error:
-                raise AuthorityError(
-                    "Emergency state is unreadable; approvals fail closed"
-                ) from error
+            read_store = open_platform_store_read_only(self.root)
+            if read_store is None:
+                return None
+            with read_store:
+                return self._revocation_timestamp(read_store)
+        return self._revocation_timestamp(store)
+
+    @staticmethod
+    def _revocation_timestamp(store: PlatformStore) -> datetime | None:
+        try:
+            record = store.head("emergency", "emergency_global")
+        except (PlatformStoreError, sqlite3.Error) as error:
+            raise AuthorityError("Emergency state is unreadable; approvals fail closed") from error
         if record is None or record.state != "active":
             return None
         active = {str(value) for value in record.payload.get("active_actions", [])}
