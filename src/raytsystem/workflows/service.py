@@ -8,8 +8,9 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from raytsystem.authority import AuthorityError, AuthorityResolver
+from raytsystem.authority import AuthorityError, AuthorityResolver, workflow_approval_target
 from raytsystem.contracts import (
+    ApprovalRecord,
     WorkflowApprovalGate,
     WorkflowDefinition,
     WorkflowNode,
@@ -53,10 +54,6 @@ _BUILTIN_OPERATIONS: dict[str, Operation] = {
     "identity": _identity_operation,
     "summarize_keys": _summarize_keys_operation,
 }
-
-
-def workflow_approval_target(workflow_run_id: str, node_id: str) -> str:
-    return derive_id("wfappr", {"node_id": node_id, "workflow_run_id": workflow_run_id})
 
 
 def _retry_delay_ms(policy: WorkflowRetryPolicy, attempt: int) -> int:
@@ -390,14 +387,20 @@ class WorkflowService:
                 )
                 raise WorkflowError("Workflow approval gate has expired")
             try:
-                AuthorityResolver(self.root).require_approval(
+                approval = AuthorityResolver(self.root).require_approval(
                     approval_id,
                     action=_APPROVAL_ACTION,
                     target_id=workflow_approval_target(workflow_run_id, node_id),
                     artifact_sha256=run.input_sha256,
                     required_scope=frozenset({gate.required_role}),
+                    policy_sha256=gate.scope_sha256,
                     at=now,
                 )
+                if (
+                    not isinstance(approval, ApprovalRecord)
+                    or approval.policy_version != gate.schema_version
+                ):
+                    raise AuthorityError("Workflow approval policy version is invalid")
             except AuthorityError as error:
                 raise WorkflowError("Workflow approval authority is invalid") from error
             output = {"approval_id": approval_id, "granted_by": actor_id}

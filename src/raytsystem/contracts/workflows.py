@@ -57,6 +57,27 @@ class WorkflowApprovalGate(VersionedModel):
     expires_after_seconds: int = Field(ge=1, le=604_800)
 
 
+class PendingWorkflowApproval(VersionedModel):
+    """Trusted, immutable binding for one currently waiting approval node."""
+
+    schema_name: Literal["PendingWorkflowApprovalV1"] = "PendingWorkflowApprovalV1"
+    workflow_run_id: Identifier
+    step_run_id: Identifier
+    node_id: Identifier
+    approval_gate_id: Identifier
+    action: Identifier
+    target_id: Identifier
+    input_sha256: Sha256
+    scope_sha256: Sha256
+    required_role: Identifier
+    expires_at: AwareDatetime
+
+    @field_validator("expires_at")
+    @classmethod
+    def _expiry_utc(cls, value: datetime) -> datetime:
+        return value.astimezone(UTC)
+
+
 class WorkflowNode(VersionedModel):
     schema_name: Literal["WorkflowNodeV1"] = "WorkflowNodeV1"
     node_id: Identifier

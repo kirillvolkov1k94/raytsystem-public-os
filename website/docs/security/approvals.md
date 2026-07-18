@@ -17,6 +17,8 @@ related_pages:
   - /reference/feature-flags
 source_of_truth:
   - path: src/raytsystem/authority.py
+  - path: src/raytsystem/contracts/workflows.py
+  - path: src/raytsystem/workflows/service.py
   - path: docs/10-execution-security.md
 last_verified_against: "schema v1.4.0"
 ---
@@ -29,6 +31,11 @@ Approval — это точная, истекающая запись, котор�
 привязана к конкретным полям и проверяется fail-closed резолвером `AuthorityResolver`,
 который берёт записи только из доверенных локальных хранилищ. Источник:
 `src/raytsystem/authority.py`.
+
+Для approval-узлов workflow публичный `ApprovalAuthorityService` сначала читает текущий
+`waiting`-шаг, его run и зарегистрированный immutable gate из `PlatformStore`. Клиент передаёт
+только run, node, approver и idempotency key: хэш входа, роль и срок действия нельзя подменить
+параметрами вызова.
 
 ## Когда использовать
 
@@ -62,6 +69,23 @@ Approval привязано к хэшу полезной нагрузки. Ес�
 резолвер выбросит ошибку `Approval does not match the exact action scope`. Точно так же
 отклоняется approval с истёкшим сроком, с другим destination, с целью вне привязки или с
 недостаточным scope. Это исключает повторное использование «почти подходящего» разрешения.
+
+## Approval для workflow
+
+`ApprovalAuthorityService.inspect_pending(workflow_run_id, node_id, at=None)` возвращает
+immutable `PendingWorkflowApproval`: точные идентификаторы run, step, node и gate, action и target,
+проверенный хэш входа, scope hash, требуемую роль и абсолютный UTC-срок действия.
+
+`ApprovalAuthorityService.issue_approval(..., approver, idempotency_key, at=None)` повторно читает
+те же доверенные записи и создаёт стандартный `ApprovalRecord`. Запись approval и две стороны
+idempotency binding — pending target и caller key — сохраняются одной транзакцией. Точный повтор
+при всё ещё ожидающем шаге и действующем gate возвращает тот же `approval_id`; смена approver,
+key, run/node binding, входа или gate отклоняется без второй записи. Истёкший gate, неверный node
+и шаг не в состоянии `waiting` также отклоняются.
+
+Issuance не меняет состояние workflow. Единственный переход approval-шага остаётся в
+`WorkflowService.grant_approval()`, который повторно проверяет точный authority record перед
+переходом.
 
 ## Пример
 
@@ -107,4 +131,6 @@ uv run raytsystem workflow approve
 ## Источники истины
 
 - `src/raytsystem/authority.py`
+- `src/raytsystem/contracts/workflows.py`
+- `src/raytsystem/workflows/service.py`
 - `docs/10-execution-security.md`

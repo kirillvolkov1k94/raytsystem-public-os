@@ -203,6 +203,7 @@ from raytsystem.contracts.proposals import (
 from raytsystem.contracts.workflows import (
     Notification,
     NotificationOutbox,
+    PendingWorkflowApproval,
     WorkflowApprovalGate,
     WorkflowArtifactBinding,
     WorkflowCondition,
@@ -478,6 +479,7 @@ __all__ = [
     "OutboxState",
     "PackManifest",
     "PdfLocator",
+    "PendingWorkflowApproval",
     "PolicyDecision",
     "PolicyOutcome",
     "ProducerRef",

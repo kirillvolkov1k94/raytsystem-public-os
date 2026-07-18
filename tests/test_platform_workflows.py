@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from platform_helpers import make_platform_workspace, store_approval
 from raytsystem.contracts import (
+    ApprovalRecord,
     WorkflowApprovalGate,
     WorkflowDefinition,
     WorkflowEdge,
@@ -22,8 +23,8 @@ from raytsystem.contracts import (
     sha256_hex,
 )
 from raytsystem.contracts.workflows import WorkflowNodeType
-from raytsystem.platform_store import open_platform_store_read_only
-from raytsystem.workflows import WorkflowError, WorkflowService
+from raytsystem.platform_store import initialize_platform_store, open_platform_store_read_only
+from raytsystem.workflows import ApprovalAuthorityService, WorkflowError, WorkflowService
 from raytsystem.workflows.service import workflow_approval_target
 
 pytestmark = pytest.mark.filterwarnings("error")
@@ -268,12 +269,52 @@ def test_approval_grant_continues_and_wrong_target_is_rejected(tmp_path: Path) -
             approval_id=wrong_target.approval_id,
             actor_id=ACTOR,
         )
-    approval = store_approval(
+    gate_unbound = store_approval(
         root,
         action="workflow_approval",
         target_id=workflow_approval_target(run.workflow_run_id, "step_gate"),
         artifact_sha256=run.input_sha256,
         scope=(GATE.required_role,),
+    )
+    with pytest.raises(WorkflowError, match="authority"):
+        service.grant_approval(
+            run.workflow_run_id,
+            "step_gate",
+            approval_id=gate_unbound.approval_id,
+            actor_id=ACTOR,
+        )
+    issued_at = datetime.now(UTC)
+    wrong_policy_version = ApprovalRecord.create(
+        action="workflow_approval",
+        target_id=workflow_approval_target(run.workflow_run_id, "step_gate"),
+        artifact_sha256=run.input_sha256,
+        scope=(GATE.required_role,),
+        policy_version="0.9.0",
+        policy_sha256=GATE.scope_sha256,
+        approver=ACTOR,
+        approved_at=issued_at,
+        expires_at=issued_at + timedelta(hours=1),
+    )
+    with initialize_platform_store(root) as store:
+        store.append_record(
+            kind="authority_approval",
+            record_id=wrong_policy_version.approval_id,
+            payload=wrong_policy_version.model_dump(mode="json"),
+            state="accepted",
+            expected_revision=None,
+        )
+    with pytest.raises(WorkflowError, match="authority"):
+        service.grant_approval(
+            run.workflow_run_id,
+            "step_gate",
+            approval_id=wrong_policy_version.approval_id,
+            actor_id=ACTOR,
+        )
+    approval = ApprovalAuthorityService(root).issue_approval(
+        run.workflow_run_id,
+        "step_gate",
+        approver=ACTOR,
+        idempotency_key="platform_workflow_grant",
     )
     service.grant_approval(
         run.workflow_run_id, "step_gate", approval_id=approval.approval_id, actor_id=ACTOR
@@ -342,12 +383,11 @@ def test_crash_recovery_resumes_without_reexecuting_steps(tmp_path: Path) -> Non
 
     recovered.operations["identity"] = _must_not_run
     recovered.operations["summarize_keys"] = _capture
-    approval = store_approval(
-        root,
-        action="workflow_approval",
-        target_id=workflow_approval_target(run.workflow_run_id, "step_gate"),
-        artifact_sha256=run.input_sha256,
-        scope=(GATE.required_role,),
+    approval = ApprovalAuthorityService(root).issue_approval(
+        run.workflow_run_id,
+        "step_gate",
+        approver=ACTOR,
+        idempotency_key="platform_workflow_recovery",
     )
     recovered.grant_approval(
         run.workflow_run_id, "step_gate", approval_id=approval.approval_id, actor_id=ACTOR
