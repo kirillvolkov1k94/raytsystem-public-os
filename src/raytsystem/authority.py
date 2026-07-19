@@ -10,9 +10,9 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from raytsystem.contracts import (
     ApprovalRecord,
@@ -35,6 +35,7 @@ from raytsystem.execution.store import ExecutionStore, ExecutionStoreError
 from raytsystem.platform_store import (
     PlatformStore,
     PlatformStoreError,
+    StoredRecord,
     initialize_platform_store,
     open_platform_store_read_only,
 )
@@ -44,6 +45,7 @@ _WORKFLOW_APPROVAL_ACTION = "workflow_approval"
 _ISSUANCE_TARGET_SCOPE = "workflow_approval_issuance_target"
 _ISSUANCE_KEY_SCOPE = "workflow_approval_issuance_key"
 _PENDING_CURSOR_NAMESPACE = "workflow_pending_approval_v1"
+_PENDING_CURSOR_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class AuthorityError(RuntimeError):
@@ -68,15 +70,12 @@ class _PendingWorkflowCursor(BaseModel):
 
     version: Literal[1] = 1
     snapshot_id: str
-    observed_at: datetime
+    observed_at_us: int = Field(
+        ge=-62_135_596_800_000_000,
+        le=253_402_300_799_999_999,
+        strict=True,
+    )
     after: tuple[str, str, str]
-
-    @field_validator("observed_at")
-    @classmethod
-    def _observed_at_utc(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("Cursor observation time must be timezone-aware")
-        return value.astimezone(UTC)
 
 
 class ApprovalAuthorityService:
@@ -126,39 +125,31 @@ class ApprovalAuthorityService:
                     after = None
                 else:
                     if decoded.snapshot_id != current_snapshot_id:
-                        raise AuthorityError(
-                            "Workflow approval pagination changed concurrently"
-                        )
-                    if requested_at is not None and requested_at != decoded.observed_at:
+                        raise AuthorityError("Workflow approval pagination changed concurrently")
+                    observed_at = self._from_epoch_microseconds(decoded.observed_at_us)
+                    if requested_at is not None and requested_at != observed_at:
                         raise AuthorityError(
                             "Workflow approval pagination observation is inconsistent"
                         )
-                    observed_at = decoded.observed_at
                     after = decoded.after
                 items: list[PendingWorkflowApproval] = []
-                found_after = after is None
                 has_more = False
-                for pending in self._iter_pending(store, observed_at):
-                    position = self._pending_position(pending)
-                    if not found_after:
-                        if position == after:
-                            found_after = True
-                            continue
-                        if after is not None and position > after:
-                            raise AuthorityError("Workflow approval cursor position is invalid")
-                        continue
+                for pending in self._iter_pending(
+                    store,
+                    observed_at,
+                    after=after,
+                    batch_size=min(limit + 1, 500),
+                ):
                     if len(items) == limit:
                         has_more = True
                         break
                     items.append(pending)
-                if not found_after:
-                    raise AuthorityError("Workflow approval cursor position is invalid")
                 next_cursor = None
                 if has_more:
                     next_cursor = self._encode_pending_cursor(
                         _PendingWorkflowCursor(
                             snapshot_id=current_snapshot_id,
-                            observed_at=observed_at,
+                            observed_at_us=self._to_epoch_microseconds(observed_at),
                             after=self._pending_position(items[-1]),
                         ),
                         signing_key,
@@ -196,21 +187,26 @@ class ApprovalAuthorityService:
                     "approver": approver,
                     "idempotency_key": idempotency_key,
                 }
-                target_receipt = store.idempotent_receipt(
-                    scope=_ISSUANCE_TARGET_SCOPE,
-                    idempotency_key=context.pending.target_id,
-                    request=request,
-                )
-                key_receipt = store.idempotent_receipt(
-                    scope=_ISSUANCE_KEY_SCOPE,
-                    idempotency_key=idempotency_key,
-                    request=request,
-                )
+                try:
+                    target_receipt, key_receipt = self._issuance_receipts(
+                        store,
+                        context,
+                        idempotency_key,
+                        request,
+                    )
+                except PlatformStoreError as current_error:
+                    try:
+                        target_receipt, key_receipt = self._issuance_receipts(
+                            store,
+                            context,
+                            idempotency_key,
+                            self._legacy_issuance_request(request),
+                        )
+                    except PlatformStoreError as legacy_error:
+                        raise current_error from legacy_error
                 if target_receipt is not None or key_receipt is not None:
                     if target_receipt is None or target_receipt != key_receipt:
-                        raise AuthorityError(
-                            "Workflow approval idempotency binding is incomplete"
-                        )
+                        raise AuthorityError("Workflow approval idempotency binding is incomplete")
                     return self._stored_approval(store, target_receipt, context, approver, now)
 
                 approval = ApprovalRecord.create(
@@ -248,11 +244,38 @@ class ApprovalAuthorityService:
         except AuthorityError:
             raise
         except PlatformStoreError as error:
-            raise AuthorityError(
-                "Workflow approval idempotency binding is invalid"
-            ) from error
+            raise AuthorityError("Workflow approval idempotency binding is invalid") from error
         except (OSError, sqlite3.Error, ValidationError, TypeError, ValueError) as error:
             raise AuthorityError("Workflow approval issuance is invalid") from error
+
+    @staticmethod
+    def _issuance_receipts(
+        store: PlatformStore,
+        context: _PendingWorkflowContext,
+        idempotency_key: str,
+        request: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        target_receipt = store.idempotent_receipt(
+            scope=_ISSUANCE_TARGET_SCOPE,
+            idempotency_key=context.pending.target_id,
+            request=request,
+        )
+        key_receipt = store.idempotent_receipt(
+            scope=_ISSUANCE_KEY_SCOPE,
+            idempotency_key=idempotency_key,
+            request=request,
+        )
+        return target_receipt, key_receipt
+
+    @staticmethod
+    def _legacy_issuance_request(request: dict[str, Any]) -> dict[str, Any]:
+        pending = request.get("pending")
+        if not isinstance(pending, dict):
+            raise PlatformStoreError("Workflow approval issuance request is invalid")
+        legacy_pending = dict(pending)
+        legacy_pending.pop("revision_id", None)
+        legacy_pending.pop("policy_version", None)
+        return request | {"pending": legacy_pending}
 
     def _pending_context(
         self,
@@ -312,9 +335,7 @@ class ApprovalAuthorityService:
             raise AuthorityError("Workflow step is not waiting on the trusted input")
 
         gate_id = node.approval_gate_id
-        gate_record = (
-            None if gate_id is None else store.head("workflow_approval_gate", gate_id)
-        )
+        gate_record = None if gate_id is None else store.head("workflow_approval_gate", gate_id)
         if (
             gate_record is None
             or gate_record.kind != "workflow_approval_gate"
@@ -357,62 +378,96 @@ class ApprovalAuthorityService:
         self,
         store: PlatformStore,
         observed_at: datetime,
+        *,
+        after: tuple[str, str, str] | None,
+        batch_size: int,
     ) -> Iterator[PendingWorkflowApproval]:
-        for run_record in store.iter_heads("workflow_run"):
-            run_payload = dict(run_record.payload)
-            raw_inputs = run_payload.pop("inputs", None)
-            if not isinstance(raw_inputs, dict):
-                raise AuthorityError("Workflow run input binding is invalid")
-            run = WorkflowRun.model_validate(run_payload)
+        after_record_id = None
+        if after is not None:
+            after_record_id = after[0]
+            after_record = store.head("workflow_run", after_record_id)
+            if after_record is None:
+                raise AuthorityError("Workflow approval cursor position is invalid")
+            found_after = False
+            for pending in self._pending_for_run(store, after_record, observed_at):
+                position = self._pending_position(pending)
+                if position == after:
+                    found_after = True
+                    continue
+                if not found_after:
+                    if position > after:
+                        raise AuthorityError("Workflow approval cursor position is invalid")
+                    continue
+                yield pending
+            if not found_after:
+                raise AuthorityError("Workflow approval cursor position is invalid")
+        for run_record in store.iter_heads(
+            "workflow_run",
+            after_record_id=after_record_id,
+            batch_size=batch_size,
+        ):
+            yield from self._pending_for_run(store, run_record, observed_at)
+
+    def _pending_for_run(
+        self,
+        store: PlatformStore,
+        run_record: StoredRecord,
+        observed_at: datetime,
+    ) -> Iterator[PendingWorkflowApproval]:
+        run_payload = dict(run_record.payload)
+        raw_inputs = run_payload.pop("inputs", None)
+        if not isinstance(raw_inputs, dict):
+            raise AuthorityError("Workflow run input binding is invalid")
+        run = WorkflowRun.model_validate(run_payload)
+        if (
+            run_record.kind != "workflow_run"
+            or run_record.record_id != run.workflow_run_id
+            or run_record.state != run.state
+            or sha256_hex(canonical_json_bytes(raw_inputs)) != run.input_sha256
+            or len(run.step_run_ids) != len(set(run.step_run_ids))
+        ):
+            raise AuthorityError("Workflow run binding is invalid")
+        revision = self._canonical_revision(store, run.revision_id)
+        node_by_id = {node.node_id: node for node in revision.nodes}
+        candidates: list[tuple[str, str]] = []
+        for step_run_id in run.step_run_ids:
+            step_record = store.head("workflow_step", step_run_id)
+            if step_record is None:
+                raise AuthorityError("Workflow step record is missing")
+            step_payload = {
+                key: value
+                for key, value in step_record.payload.items()
+                if key not in {"failure_reason", "output"}
+            }
+            step = WorkflowStepRun.model_validate(step_payload)
+            node = node_by_id.get(step.node_id)
             if (
-                run_record.kind != "workflow_run"
-                or run_record.record_id != run.workflow_run_id
-                or run_record.state != run.state
-                or sha256_hex(canonical_json_bytes(raw_inputs)) != run.input_sha256
-                or len(run.step_run_ids) != len(set(run.step_run_ids))
+                step_record.kind != "workflow_step"
+                or step_record.record_id != step_run_id
+                or step.step_run_id != step_run_id
+                or step_record.state != step.state
+                or step.workflow_run_id != run.workflow_run_id
+                or step.input_sha256 != run.input_sha256
+                or node is None
             ):
-                raise AuthorityError("Workflow run binding is invalid")
-            revision = self._canonical_revision(store, run.revision_id)
-            node_by_id = {node.node_id: node for node in revision.nodes}
-            candidates: list[tuple[str, str]] = []
-            for step_run_id in run.step_run_ids:
-                step_record = store.head("workflow_step", step_run_id)
-                if step_record is None:
-                    raise AuthorityError("Workflow step record is missing")
-                step_payload = {
-                    key: value
-                    for key, value in step_record.payload.items()
-                    if key not in {"failure_reason", "output"}
-                }
-                step = WorkflowStepRun.model_validate(step_payload)
-                node = node_by_id.get(step.node_id)
-                if (
-                    step_record.kind != "workflow_step"
-                    or step_record.record_id != step_run_id
-                    or step.step_run_id != step_run_id
-                    or step_record.state != step.state
-                    or step.workflow_run_id != run.workflow_run_id
-                    or step.input_sha256 != run.input_sha256
-                    or node is None
-                ):
-                    raise AuthorityError("Workflow step binding is invalid")
-                if step.state == "waiting" and node.node_type is WorkflowNodeType.APPROVAL:
-                    candidates.append((node.node_id, step.step_run_id))
-            for node_id, _step_run_id in sorted(candidates):
-                try:
-                    yield self._pending_context(
-                        store,
-                        run.workflow_run_id,
-                        node_id,
-                        observed_at,
-                    ).pending
-                except AuthorityError as error:
-                    if str(error) in {
-                        "Workflow approval gate is not active yet",
-                        "Workflow approval gate has expired",
-                    }:
-                        continue
-                    raise
+                raise AuthorityError("Workflow step binding is invalid")
+            if step.state == "waiting" and node.node_type is WorkflowNodeType.APPROVAL:
+                candidates.append((node.node_id, step.step_run_id))
+        for node_id, _step_run_id in sorted(candidates):
+            try:
+                yield self._pending_context(
+                    store,
+                    run.workflow_run_id,
+                    node_id,
+                    observed_at,
+                ).pending
+            except AuthorityError as error:
+                if str(error) in {
+                    "Workflow approval gate is not active yet",
+                    "Workflow approval gate has expired",
+                }:
+                    continue
+                raise
 
     @staticmethod
     def _canonical_revision(
@@ -430,9 +485,7 @@ class ApprovalAuthorityService:
             raise AuthorityError("Workflow revision is not immutable and validated")
         revision = WorkflowRevision.model_validate(revision_record.payload)
         manifest = sha256_hex(
-            canonical_json_bytes(
-                revision.model_dump(mode="json", exclude={"manifest_sha256"})
-            )
+            canonical_json_bytes(revision.model_dump(mode="json", exclude={"manifest_sha256"}))
         )
         if revision.revision_id != revision_id or manifest != revision.manifest_sha256:
             raise AuthorityError("Workflow revision binding is invalid")
@@ -441,6 +494,15 @@ class ApprovalAuthorityService:
     @staticmethod
     def _pending_position(pending: PendingWorkflowApproval) -> tuple[str, str, str]:
         return pending.workflow_run_id, pending.node_id, pending.step_run_id
+
+    @staticmethod
+    def _to_epoch_microseconds(value: datetime) -> int:
+        delta = value.astimezone(UTC) - _PENDING_CURSOR_EPOCH
+        return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+    @staticmethod
+    def _from_epoch_microseconds(value: int) -> datetime:
+        return _PENDING_CURSOR_EPOCH + timedelta(microseconds=value)
 
     @staticmethod
     def _encode_pending_cursor(cursor: _PendingWorkflowCursor, signing_key: bytes) -> str:

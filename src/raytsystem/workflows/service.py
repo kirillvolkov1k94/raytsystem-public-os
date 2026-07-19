@@ -75,9 +75,7 @@ class _WorkflowRunProjection(BaseModel):
 
     @classmethod
     def from_run(cls, run: WorkflowRun) -> _WorkflowRunProjection:
-        return cls.model_validate(
-            run.model_dump(mode="python", exclude={"state", "completed_at"})
-        )
+        return cls.model_validate(run.model_dump(mode="python", exclude={"state", "completed_at"}))
 
 
 class _WorkflowDecisionReceipt(BaseModel):
@@ -142,8 +140,7 @@ class _WorkflowDecisionReceipt(BaseModel):
                 or pending.node_id != self.node_id
                 or pending.approval_gate_id != self.approval_gate_id
                 or pending.action != self.gate_action
-                or pending.target_id
-                != workflow_approval_target(self.workflow_run_id, self.node_id)
+                or pending.target_id != workflow_approval_target(self.workflow_run_id, self.node_id)
                 or pending.input_sha256 != self.input_sha256
                 or pending.scope_sha256 != self.policy_sha256
                 or pending.policy_version != self.policy_version
@@ -179,7 +176,16 @@ class _WorkflowDecisionReceipt(BaseModel):
         return payload
 
     def identity_payload(self) -> dict[str, Any]:
-        return self.model_dump(mode="python", exclude={"receipt_id"})
+        excluded = {"receipt_id"}
+        if self.expected_pending is None:
+            excluded.add("expected_pending")
+        return self.model_dump(mode="python", exclude=excluded)
+
+    def storage_payload(self) -> dict[str, Any]:
+        excluded: set[str] = set()
+        if self.expected_pending is None:
+            excluded.add("expected_pending")
+        return self.model_dump(mode="json", exclude=excluded)
 
     def verify_id(self) -> bool:
         return self.receipt_id == derive_id("wdec", self.identity_payload())
@@ -654,12 +660,16 @@ class WorkflowService:
             if prior is not None:
                 return self._replay_workflow_decision(store, context, prior)
             try:
-                live = ApprovalAuthorityService(self.root)._pending_context(
-                    store,
-                    workflow_run_id,
-                    node_id,
-                    now,
-                ).pending
+                live = (
+                    ApprovalAuthorityService(self.root)
+                    ._pending_context(
+                        store,
+                        workflow_run_id,
+                        node_id,
+                        now,
+                    )
+                    .pending
+                )
             except AuthorityError as error:
                 raise WorkflowError("Workflow denial pending binding is unavailable") from error
             if live != expected:
@@ -1234,13 +1244,14 @@ class WorkflowService:
         store: PlatformStore,
         receipt: _WorkflowDecisionReceipt,
     ) -> None:
+        stored_payload = receipt.storage_payload()
         stored = store.idempotent_receipt(
             scope=_APPROVAL_DECISION_SCOPE,
             idempotency_key=receipt.idempotency_key,
             request=receipt.request_payload(),
-            receipt=receipt.model_dump(mode="json"),
+            receipt=stored_payload,
         )
-        if stored != receipt.model_dump(mode="json"):
+        if stored != stored_payload:
             raise WorkflowError("Workflow approval decision receipt changed concurrently")
 
     def _replay_workflow_decision(
@@ -1282,9 +1293,7 @@ class WorkflowService:
             ):
                 raise WorkflowError("Workflow approval decision terminal receipt is orphaned")
             if receipt.decision == "grant":
-                expected_output_sha256 = sha256_hex(
-                    canonical_json_bytes(expected_output)
-                )
+                expected_output_sha256 = sha256_hex(canonical_json_bytes(expected_output))
                 if (
                     step.approval_id != receipt.approval_id
                     or step.output_sha256 != expected_output_sha256
@@ -1380,9 +1389,7 @@ class WorkflowService:
         if type(expected) is not PendingWorkflowApproval:
             raise WorkflowError("Workflow denial requires a typed expected pending binding")
         try:
-            validated = PendingWorkflowApproval.model_validate(
-                expected.model_dump(mode="python")
-            )
+            validated = PendingWorkflowApproval.model_validate(expected.model_dump(mode="python"))
         except (ValidationError, TypeError, ValueError) as error:
             raise WorkflowError("Workflow denial expected binding is malformed") from error
         if validated != expected:
@@ -1432,9 +1439,7 @@ class WorkflowService:
         except ValidationError as error:
             raise WorkflowError("Workflow revision contract is invalid") from error
         manifest = sha256_hex(
-            canonical_json_bytes(
-                revision.model_dump(mode="json", exclude={"manifest_sha256"})
-            )
+            canonical_json_bytes(revision.model_dump(mode="json", exclude={"manifest_sha256"}))
         )
         if revision.revision_id != revision_id or manifest != revision.manifest_sha256:
             raise WorkflowError("Workflow revision binding is invalid")

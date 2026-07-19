@@ -326,11 +326,25 @@ class PlatformStore:
             ).fetchall()
         return tuple(_stored_record(row) for row in rows)
 
-    def iter_heads(self, kind: str) -> Iterator[StoredRecord]:
+    def iter_heads(
+        self,
+        kind: str,
+        *,
+        after_record_id: str | None = None,
+        batch_size: int = 500,
+    ) -> Iterator[StoredRecord]:
         """Stream every canonical record head in stable ID order without a snapshot limit."""
 
         _validate_token(kind, "record kind")
-        after_record_id = ""
+        if after_record_id is not None:
+            _validate_token(after_record_id, "record ID")
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or not 1 <= batch_size <= 500
+        ):
+            raise ValueError("Record iterator batch size is out of bounds")
+        current_record_id = after_record_id or ""
         while True:
             rows = self.connection.execute(
                 "SELECT r.kind AS kind, r.record_id AS record_id, "
@@ -340,8 +354,8 @@ class PlatformStore:
                 "h.payload_sha256 AS head_payload_sha256 "
                 "FROM record_heads h LEFT JOIN records r "
                 "ON r.kind=h.kind AND r.record_id=h.record_id AND r.revision=h.revision "
-                "WHERE h.kind=? AND h.record_id>? ORDER BY h.record_id LIMIT 500",
-                (kind, after_record_id),
+                "WHERE h.kind=? AND h.record_id>? ORDER BY h.record_id LIMIT ?",
+                (kind, current_record_id, batch_size),
             ).fetchall()
             if not rows:
                 return
@@ -354,7 +368,7 @@ class PlatformStore:
                     raise PlatformStoreError("Record head payload binding is invalid")
                 record = _stored_record(row)
                 yield record
-                after_record_id = record.record_id
+                current_record_id = record.record_id
 
     def opaque_cursor_key(self, namespace: str) -> bytes:
         """Return a workspace-local HMAC key while holding the writer transaction."""

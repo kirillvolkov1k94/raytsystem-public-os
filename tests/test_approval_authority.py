@@ -139,15 +139,12 @@ def _historical_pending_runs(
                 "revision_id": revision_id,
                 "version": f"1.{revision_index}.0",
                 "previous_revision_id": previous_revision_id,
-                "created_at": datetime(2040, 1, 1, tzinfo=UTC)
-                + timedelta(seconds=revision_index),
+                "created_at": datetime(2040, 1, 1, tzinfo=UTC) + timedelta(seconds=revision_index),
                 "manifest_sha256": "0" * 64,
             }
         )
         manifest = sha256_hex(
-            canonical_json_bytes(
-                draft.model_dump(mode="json", exclude={"manifest_sha256"})
-            )
+            canonical_json_bytes(draft.model_dump(mode="json", exclude={"manifest_sha256"}))
         )
         revision = draft.model_copy(update={"manifest_sha256": manifest})
         service.register(
@@ -311,9 +308,7 @@ class _NoOffsetTimezone(tzinfo):
 def test_inspect_pending_returns_exact_immutable_trusted_binding(tmp_path: Path) -> None:
     root = make_platform_workspace(tmp_path)
     _, workflow_run_id = _start_waiting(root)
-    local_at = (WAIT_STARTED + timedelta(seconds=10)).astimezone(
-        timezone(timedelta(hours=7))
-    )
+    local_at = (WAIT_STARTED + timedelta(seconds=10)).astimezone(timezone(timedelta(hours=7)))
 
     pending = ApprovalAuthorityService(root).inspect_pending(
         workflow_run_id, "step_gate", at=local_at
@@ -328,9 +323,7 @@ def test_inspect_pending_returns_exact_immutable_trusted_binding(tmp_path: Path)
         node_id="step_gate",
         approval_gate_id=GATE.approval_gate_id,
         action=GATE.action,
-        target_id=derive_id(
-            "wfappr", {"node_id": "step_gate", "workflow_run_id": workflow_run_id}
-        ),
+        target_id=derive_id("wfappr", {"node_id": "step_gate", "workflow_run_id": workflow_run_id}),
         input_sha256=sha256_hex(canonical_json_bytes({"seed": "value"})),
         scope_sha256=GATE.scope_sha256,
         policy_version=GATE.schema_version,
@@ -373,9 +366,7 @@ def test_list_pending_returns_an_exact_consistency_bound_page(tmp_path: Path) ->
     page = authority.list_pending(limit=1, at=observed_at)
 
     assert type(page) is PendingWorkflowApprovalPage
-    assert page.items == (
-        authority.inspect_pending(workflow_run_id, "step_gate", at=observed_at),
-    )
+    assert page.items == (authority.inspect_pending(workflow_run_id, "step_gate", at=observed_at),)
     assert page.next_cursor is None
     assert page.snapshot_id.startswith("pview_")
     assert page.observed_at == observed_at
@@ -424,6 +415,112 @@ def test_list_pending_traverses_204_runs_across_51_historical_revisions(
     assert [len(page.items) for page in pages] == [37, 37, 37, 37, 37, 19]
     assert len({page.snapshot_id for page in pages}) == 1
     assert all(page.observed_at == observed_at for page in pages)
+
+
+def test_list_pending_preserves_default_observation_microseconds_across_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_platform_workspace(tmp_path)
+    run_ids = [
+        _start_waiting(root, idempotency_key=f"workflow_microseconds_{index}")[1]
+        for index in range(2)
+    ]
+    observed_at = WAIT_STARTED + timedelta(seconds=10, microseconds=654321)
+    waiting_since = observed_at - timedelta(microseconds=1)
+    for workflow_run_id in run_ids:
+        step = _step_head(root, workflow_run_id)
+        changed = dict(step.payload)
+        changed["started_at"] = waiting_since.isoformat().replace("+00:00", "Z")
+        rendered = canonical_json_bytes(changed)
+        digest = sha256_hex(rendered)
+        with initialize_platform_store(root) as store, store.transaction():
+            store.connection.execute(
+                "UPDATE records SET payload_json=?, payload_sha256=? "
+                "WHERE kind=? AND record_id=? AND revision=?",
+                (
+                    rendered.decode("utf-8"),
+                    digest,
+                    step.kind,
+                    step.record_id,
+                    step.revision,
+                ),
+            )
+            store.connection.execute(
+                "UPDATE record_heads SET payload_sha256=? WHERE kind=? AND record_id=?",
+                (digest, step.kind, step.record_id),
+            )
+
+    class _ObservedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return observed_at if tz is not None else observed_at.replace(tzinfo=None)
+
+    monkeypatch.setattr(authority_module, "datetime", _ObservedDatetime)
+    authority = ApprovalAuthorityService(root)
+
+    first = authority.list_pending(limit=1)
+    assert first.next_cursor is not None
+    second = authority.list_pending(limit=1, cursor=first.next_cursor)
+
+    assert first.observed_at == observed_at
+    assert second.observed_at == observed_at
+    assert len(first.items) == len(second.items) == 1
+    assert first.items[0].workflow_run_id != second.items[0].workflow_run_id
+
+
+def test_list_pending_resumes_from_cursor_run_without_rescanning_prior_heads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_platform_workspace(tmp_path)
+    _historical_pending_runs(root, revision_count=51, runs_per_revision=4)
+    authority = ApprovalAuthorityService(root)
+    observed_at = WAIT_STARTED + timedelta(seconds=10)
+    first = authority.list_pending(limit=37, at=observed_at)
+    assert first.next_cursor is not None
+    after_run_id = first.items[-1].workflow_run_id
+    original = PlatformStore.iter_heads
+    calls: list[tuple[str | None, int]] = []
+    yielded_run_ids: list[str] = []
+    head_queries: list[str] = []
+
+    def _tracked_iter_heads(
+        self: PlatformStore,
+        kind: str,
+        *,
+        after_record_id: str | None = None,
+        batch_size: int = 500,
+    ) -> Any:
+        calls.append((after_record_id, batch_size))
+        self.connection.set_trace_callback(
+            lambda statement: (
+                head_queries.append(statement)
+                if "FROM record_heads h LEFT JOIN records r" in statement
+                else None
+            )
+        )
+        try:
+            for record in original(
+                self,
+                kind,
+                after_record_id=after_record_id,
+                batch_size=batch_size,
+            ):
+                yielded_run_ids.append(record.record_id)
+                yield record
+        finally:
+            self.connection.set_trace_callback(None)
+
+    monkeypatch.setattr(PlatformStore, "iter_heads", _tracked_iter_heads)
+
+    second = authority.list_pending(limit=37, cursor=first.next_cursor)
+
+    assert len(second.items) == 37
+    assert calls == [(after_run_id, 38)]
+    assert len(head_queries) == 1
+    assert len(yielded_run_ids) <= 38
+    assert all(record_id > after_run_id for record_id in yielded_run_ids)
 
 
 def test_list_pending_cursor_is_opaque_and_tampering_fails_closed(tmp_path: Path) -> None:
@@ -608,11 +705,59 @@ def test_exact_issuance_is_persisted_idempotently_without_transition(tmp_path: P
     assert _approval_count(root) == 1
     assert _receipt_count(root) == 2
     with initialize_platform_store(root) as store:
-        step = store.head("workflow_step", derive_id(
-            "wstep", {"workflow_run_id": workflow_run_id, "node_id": "step_gate"}
-        ))
+        step = store.head(
+            "workflow_step",
+            derive_id("wstep", {"workflow_run_id": workflow_run_id, "node_id": "step_gate"}),
+        )
     assert step is not None
     assert step.state == "waiting"
+
+
+def test_pre_revision_pending_issuance_receipts_replay_compatibly(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    _, workflow_run_id = _start_waiting(root)
+    authority = ApprovalAuthorityService(root)
+    idempotency_key = "approval_authority_legacy_pending"
+    pending = authority.inspect_pending(
+        workflow_run_id,
+        "step_gate",
+        at=WAIT_STARTED + timedelta(seconds=5),
+    )
+    issued = authority.issue_approval(
+        workflow_run_id,
+        "step_gate",
+        approver=APPROVER,
+        idempotency_key=idempotency_key,
+        at=WAIT_STARTED + timedelta(seconds=10),
+    )
+    legacy_pending = pending.model_dump(mode="json")
+    legacy_pending.pop("revision_id")
+    legacy_pending.pop("policy_version")
+    legacy_request = {
+        "pending": legacy_pending,
+        "gate_schema_version": GATE.schema_version,
+        "approver": APPROVER,
+        "idempotency_key": idempotency_key,
+    }
+    legacy_sha256 = sha256_hex(canonical_json_bytes(legacy_request))
+    with initialize_platform_store(root) as store, store.transaction():
+        store.connection.execute(
+            "UPDATE idempotency_receipts SET request_sha256=? "
+            "WHERE scope LIKE 'workflow_approval_issuance_%'",
+            (legacy_sha256,),
+        )
+
+    replay = authority.issue_approval(
+        workflow_run_id,
+        "step_gate",
+        approver=APPROVER,
+        idempotency_key=idempotency_key,
+        at=WAIT_STARTED + timedelta(seconds=20),
+    )
+
+    assert replay == issued
+    assert _approval_count(root) == 1
+    assert _receipt_count(root) == 2
 
 
 def test_changed_actor_key_or_request_binding_cannot_issue_again(tmp_path: Path) -> None:
@@ -701,9 +846,7 @@ def test_naive_times_fail_closed_and_offset_times_normalize_to_utc(tmp_path: Pat
             at=naive,
         )
 
-    local_at = (WAIT_STARTED + timedelta(seconds=10)).astimezone(
-        timezone(timedelta(hours=-5))
-    )
+    local_at = (WAIT_STARTED + timedelta(seconds=10)).astimezone(timezone(timedelta(hours=-5)))
     approval = authority.issue_approval(
         workflow_run_id,
         "step_gate",
@@ -1008,9 +1151,7 @@ def test_grant_rejects_noncanonical_approval_record_head(tmp_path: Path, invalid
 
 
 @pytest.mark.parametrize("invalid_gate", ["wrong_action", "payload_id", "state", "revision"])
-def test_grant_rejects_noncanonical_approval_gate_head(
-    tmp_path: Path, invalid_gate: str
-) -> None:
+def test_grant_rejects_noncanonical_approval_gate_head(tmp_path: Path, invalid_gate: str) -> None:
     root = make_platform_workspace(tmp_path / invalid_gate)
     service, workflow_run_id = _start_waiting(root)
     approval = ApprovalAuthorityService(root).issue_approval(
@@ -1037,9 +1178,7 @@ def test_grant_rejects_noncanonical_approval_gate_head(
     assert step.payload.get("approval_id") is None
     assert "output" not in step.payload
     with initialize_platform_store(root) as store:
-        event_types = tuple(
-            event["event_type"] for event in store.list_events(workflow_run_id)
-        )
+        event_types = tuple(event["event_type"] for event in store.list_events(workflow_run_id))
     assert "workflow_approval_granted" not in event_types
 
 
@@ -1239,9 +1378,7 @@ def test_grant_default_time_is_sampled_after_writer_lock_before_expiry_check(
 
     monkeypatch.setattr(PlatformStore, "transaction", _observed_transaction)
 
-    with ThreadPoolExecutor(max_workers=1) as executor, initialize_platform_store(
-        root
-    ) as blocker:
+    with ThreadPoolExecutor(max_workers=1) as executor, initialize_platform_store(root) as blocker:
         with blocker.transaction():
             result = executor.submit(
                 service.grant_approval,
@@ -1269,9 +1406,7 @@ def test_grant_default_time_is_sampled_after_writer_lock_before_expiry_check(
                 (record.record_id,),
             ).fetchall()
         )
-        event_types = tuple(
-            event["event_type"] for event in store.list_events(run.workflow_run_id)
-        )
+        event_types = tuple(event["event_type"] for event in store.list_events(run.workflow_run_id))
     assert "succeeded" not in step_states
     assert "workflow_approval_granted" not in event_types
 
@@ -1321,9 +1456,7 @@ def test_default_time_is_sampled_after_writer_lock_before_expiry_check(
             idempotency_key=f"approval_authority_lock_{operation}",
         )
 
-    with ThreadPoolExecutor(max_workers=1) as executor, initialize_platform_store(
-        root
-    ) as blocker:
+    with ThreadPoolExecutor(max_workers=1) as executor, initialize_platform_store(root) as blocker:
         with blocker.transaction():
             result = executor.submit(_call)
             assert transaction_attempted.wait(timeout=1)

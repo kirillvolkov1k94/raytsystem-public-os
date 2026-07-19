@@ -136,7 +136,9 @@ its parent). Flags that gate an external surface stay off:
   data for the UI. Approval decision retries require the original key and exact run/revision/
   node/step, actor, input, gate/policy/expiry, decision, and approval-ID binding. Deny also requires
   the exact public `PendingWorkflowApproval` previously observed; its complete binding is compared
-  under the decision transaction before any state change or audit event.
+  under the decision transaction before any state change or audit event. Legacy grant and authority
+  issuance receipts remain replay-compatible; a legacy deny without expected-binding proof fails
+  closed instead of being promoted to the exact deny contract.
 - `ApprovalAuthorityService.list_pending` enumerates every canonical run, including runs pinned to
   historical workflow revisions, without a hidden snapshot cap. It returns frozen, keyset-paginated
   `PendingWorkflowApprovalPage` records in `(run_id, node_id, step_run_id)` order. Workspace-local

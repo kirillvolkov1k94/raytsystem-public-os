@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -27,6 +28,7 @@ from raytsystem.contracts import (
     WorkflowRevision,
     WorkflowRun,
     canonical_json_bytes,
+    derive_id,
     sha256_hex,
 )
 from raytsystem.contracts.workflows import WorkflowNodeType
@@ -36,7 +38,7 @@ from raytsystem.platform_store import (
     open_platform_store_read_only,
 )
 from raytsystem.workflows import ApprovalAuthorityService, WorkflowError, WorkflowService
-from raytsystem.workflows.service import workflow_approval_target
+from raytsystem.workflows.service import _WorkflowDecisionReceipt, workflow_approval_target
 
 pytestmark = pytest.mark.filterwarnings("error")
 
@@ -179,8 +181,7 @@ def _decision_events(root: Path, workflow_run_id: str) -> tuple[dict[str, Any], 
         return tuple(
             event
             for event in store.list_events(workflow_run_id)
-            if event["event_type"]
-            in {"workflow_approval_granted", "workflow_approval_denied"}
+            if event["event_type"] in {"workflow_approval_granted", "workflow_approval_denied"}
         )
 
 
@@ -189,8 +190,7 @@ def _decision_receipt_count(root: Path) -> int:
     assert store is not None
     with store:
         row = store.connection.execute(
-            "SELECT COUNT(*) FROM idempotency_receipts "
-            "WHERE scope='workflow_approval_decision'"
+            "SELECT COUNT(*) FROM idempotency_receipts WHERE scope='workflow_approval_decision'"
         ).fetchone()
     assert row is not None
     return int(row[0])
@@ -939,6 +939,55 @@ def test_workflow_decision_crash_replay_returns_original_run_without_second_even
         assert authority_record.revision == 1
 
 
+def test_pre_expected_binding_grant_receipt_replays_compatibly(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, run, approval = _waiting_approval(root, start_key="legacy_grant_receipt")
+    decision_key = "legacy_grant_receipt_decision"
+    first = service.grant_approval(
+        run.workflow_run_id,
+        "step_gate",
+        approval_id=approval.approval_id,
+        actor_id=ACTOR,
+        idempotency_key=decision_key,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+    )
+    with initialize_platform_store(root) as store, store.transaction():
+        row = store.connection.execute(
+            "SELECT receipt_json FROM idempotency_receipts "
+            "WHERE scope='workflow_approval_decision' AND idempotency_key=?",
+            (decision_key,),
+        ).fetchone()
+        assert row is not None
+        stored_receipt = json.loads(str(row[0]))
+        assert "expected_pending" not in stored_receipt
+        parsed = _WorkflowDecisionReceipt.model_validate(stored_receipt)
+        legacy_receipt = parsed.model_dump(mode="json", exclude={"expected_pending"})
+        legacy_receipt["receipt_id"] = derive_id(
+            "wdec",
+            parsed.model_dump(
+                mode="python",
+                exclude={"receipt_id", "expected_pending"},
+            ),
+        )
+        store.connection.execute(
+            "UPDATE idempotency_receipts SET receipt_json=? "
+            "WHERE scope='workflow_approval_decision' AND idempotency_key=?",
+            (canonical_json_bytes(legacy_receipt).decode("utf-8"), decision_key),
+        )
+
+    replay = WorkflowService(root).grant_approval(
+        run.workflow_run_id,
+        "step_gate",
+        approval_id=approval.approval_id,
+        actor_id=ACTOR,
+        idempotency_key=decision_key,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+    )
+
+    assert replay == first
+    assert len(_decision_events(root, run.workflow_run_id)) == 1
+
+
 def test_workflow_grant_replay_rejects_another_revision_with_same_gate_and_input(
     tmp_path: Path,
 ) -> None:
@@ -999,9 +1048,7 @@ def test_workflow_grant_replay_rejects_changed_immutable_run_projection(
     tmp_path: Path, field: str
 ) -> None:
     root = make_platform_workspace(tmp_path / field)
-    service, run, approval = _waiting_approval(
-        root, start_key=f"decision_run_projection_{field}"
-    )
+    service, run, approval = _waiting_approval(root, start_key=f"decision_run_projection_{field}")
     decision_key = f"decision_run_projection_exact_{field}"
     service.grant_approval(
         run.workflow_run_id,
@@ -1415,9 +1462,7 @@ def test_deny_default_time_is_sampled_after_writer_lock(
             yield
 
     monkeypatch.setattr(PlatformStore, "transaction", _observed_transaction)
-    with ThreadPoolExecutor(max_workers=1) as executor, initialize_platform_store(
-        root
-    ) as blocker:
+    with ThreadPoolExecutor(max_workers=1) as executor, initialize_platform_store(root) as blocker:
         with blocker.transaction():
             result = executor.submit(
                 service.deny_approval,
