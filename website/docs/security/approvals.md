@@ -74,7 +74,17 @@ Approval привязано к хэшу полезной нагрузки. Ес�
 
 `ApprovalAuthorityService.inspect_pending(workflow_run_id, node_id, at=None)` возвращает
 immutable `PendingWorkflowApproval`: точные идентификаторы run, step, node и gate, action и target,
-проверенный хэш входа, scope hash, требуемую роль и абсолютный UTC-срок действия.
+workflow revision, проверенный хэш входа, scope hash, policy version, требуемую роль и абсолютный
+UTC-срок действия.
+
+`ApprovalAuthorityService.list_pending(limit=100, cursor=None, at=None)` возвращает замороженный
+`PendingWorkflowApprovalPage` и перечисляет ожидающие approval напрямую из канонических run,
+revision, step и gate записей. Метод не использует ограниченные `WorkflowService.snapshot()`
+списки и поэтому включает активные запуски старых revision после публикации новой. Порядок
+стабилен; `next_cursor` непрозрачен и подписан локальным ключом workspace. Все страницы одной
+обходной последовательности несут одинаковые `snapshot_id` и `observed_at`. Если записи меняются
+между страницами, cursor повреждён или caller пытается сменить время наблюдения, метод возвращает
+явную consistency error вместо пропуска или дублирования approvals.
 
 `ApprovalAuthorityService.issue_approval(..., approver, idempotency_key, at=None)` повторно читает
 те же доверенные записи и создаёт стандартный `ApprovalRecord`. Запись approval и две стороны
@@ -85,7 +95,11 @@ key, run/node binding, входа или gate отклоняется без вт
 
 Issuance не меняет состояние workflow. Публичные переходы
 `WorkflowService.grant_approval(..., idempotency_key=...)` и
-`deny_approval(..., idempotency_key=...)` требуют непустой точный ключ. При первом вызове
+`deny_approval(..., expected=pending, idempotency_key=...)` требуют непустой точный ключ; deny
+дополнительно требует тот самый типизированный `PendingWorkflowApproval`, который наблюдал caller.
+При первом deny движок под тем же `BEGIN IMMEDIATE` заново выводит live binding из канонических
+run/revision/step/gate записей и сравнивает весь контракт до перехода, event или receipt. При
+первом вызове
 движок одной транзакцией `BEGIN IMMEDIATE` фиксирует переход шага/запуска, audit event и
 immutable receipt. Receipt связывает решение с run, node, step, входным хэшем, actor,
 approval ID (только для grant), gate ID/action/role, версией и хэшем политики и сроком gate.
@@ -94,7 +108,9 @@ approval ID (только для grant), gate ID/action/role, версией и 
 проверяет receipt и точное terminal-состояние/event, затем возвращает исходный `WorkflowRun` без
 второго перехода. Другой ключ после terminal-перехода, переиспользование ключа с изменённой
 привязкой и orphan/corrupt receipt отклоняются fail-closed. Grant повторно проверяет канонический
-gate и точный accepted `ApprovalRecord`; deny не создаёт и не потребляет approval record.
+gate и точный accepted `ApprovalRecord`; deny не создаёт и не потребляет approval record. Exact
+deny replay обязан повторить исходный `expected`: тот же ключ с изменённым expected binding
+отклоняется.
 
 ## Пример
 
@@ -132,6 +148,8 @@ uv run raytsystem workflow approve <run_id> <node_id> \
 - Ожидать, что approval «широкого» scope закроет действие вне его привязки к цели/destination.
 - Повторять workflow approve с новым ключом после неясного ответа: используйте исходный
   `--idempotency-key`, иначе terminal-шаг не будет принят за успешный replay.
+- Начинать следующую страницу pending approvals заново после изменения store: продолжение старого
+  cursor намеренно вернёт consistency error; начните новый обход с `cursor=None`.
 
 ## Связанные страницы
 

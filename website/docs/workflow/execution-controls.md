@@ -71,8 +71,17 @@ uv run raytsystem notifications list --json
 Grant и deny approval-шага также требуют стабильный idempotency key. Переход, audit event и
 receipt коммитятся вместе; после потери ответа повторяйте точный запрос с тем же ключом. Exact
 replay возвращает исходный `WorkflowRun` без второго события. Новый ключ после terminal-перехода
-не считается доказательством успеха, а изменение actor, approval ID, входа или gate binding
-отклоняется.
+не считается доказательством успеха. Deny дополнительно принимает неизменённый
+`PendingWorkflowApproval`, ранее полученный от `ApprovalAuthorityService.list_pending(...)`:
+сервис в той же транзакции сверяет run/revision/step/node/gate, action/target/input/scope,
+policy version, role и expiry до любого перехода или audit-события. Изменение actor, approval ID,
+ожидаемой binding или повтор того же ключа с другими данными отклоняется.
+
+`list_pending(limit=..., cursor=..., at=...)` перечисляет pending-гейты напрямую из всех
+канонических запусков, включая исторические ревизии workflow. Результат — замороженная страница
+`PendingWorkflowApprovalPage` со стабильным порядком и opaque signed cursor. Все страницы должны
+сохранить исходные `snapshot_id` и `observed_at`; если хранилище изменилось между страницами,
+сервис явно требует начать перечисление заново и не возвращает неполный результат как полный.
 
 ## Артефакты и уведомления
 
@@ -99,6 +108,8 @@ replay возвращает исходный `WorkflowRun` без второго
 - Пытаться отправить уведомление наружу — `external_notifications_enabled = false`, allowlist назначений пуст.
 - Генерировать новый `--idempotency-key` после тайм-аута approve — повтор должен использовать
   тот же стабильный ключ и те же параметры.
+- Продолжать обход pending approvals после изменения snapshot — такой cursor намеренно
+  отклоняется; начните новый обход с первой страницы.
 
 ## Связанные страницы
 

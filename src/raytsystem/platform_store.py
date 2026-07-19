@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import sys
 from collections.abc import Iterator
@@ -324,6 +325,63 @@ class PlatformStore:
                 (kind, state, limit, offset),
             ).fetchall()
         return tuple(_stored_record(row) for row in rows)
+
+    def iter_heads(self, kind: str) -> Iterator[StoredRecord]:
+        """Stream every canonical record head in stable ID order without a snapshot limit."""
+
+        _validate_token(kind, "record kind")
+        after_record_id = ""
+        while True:
+            rows = self.connection.execute(
+                "SELECT r.kind AS kind, r.record_id AS record_id, "
+                "r.revision AS revision, r.payload_json AS payload_json, "
+                "r.payload_sha256 AS payload_sha256, r.state AS state, "
+                "r.created_at AS created_at, h.revision AS head_revision, "
+                "h.payload_sha256 AS head_payload_sha256 "
+                "FROM record_heads h LEFT JOIN records r "
+                "ON r.kind=h.kind AND r.record_id=h.record_id AND r.revision=h.revision "
+                "WHERE h.kind=? AND h.record_id>? ORDER BY h.record_id LIMIT 500",
+                (kind, after_record_id),
+            ).fetchall()
+            if not rows:
+                return
+            for row in rows:
+                if (
+                    row["revision"] is None
+                    or row["head_revision"] != row["revision"]
+                    or row["head_payload_sha256"] != row["payload_sha256"]
+                ):
+                    raise PlatformStoreError("Record head payload binding is invalid")
+                record = _stored_record(row)
+                yield record
+                after_record_id = record.record_id
+
+    def opaque_cursor_key(self, namespace: str) -> bytes:
+        """Return a workspace-local HMAC key while holding the writer transaction."""
+
+        _validate_token(namespace, "cursor namespace")
+        if self.mode != "read_write" or not self.connection.in_transaction:
+            raise PlatformStoreError("Cursor keys require a writer transaction")
+        key_name = f"opaque_cursor_key:{namespace}"
+        row = self.connection.execute(
+            "SELECT value FROM platform_meta WHERE key=?",
+            (key_name,),
+        ).fetchone()
+        if row is None:
+            encoded = secrets.token_hex(32)
+            self.connection.execute(
+                "INSERT INTO platform_meta(key, value) VALUES (?, ?)",
+                (key_name, encoded),
+            )
+        else:
+            encoded = str(row["value"])
+        try:
+            key = bytes.fromhex(encoded)
+        except ValueError as error:
+            raise PlatformStoreError("Cursor signing key is invalid") from error
+        if len(key) != 32:
+            raise PlatformStoreError("Cursor signing key is invalid")
+        return key
 
     def append_event(
         self,

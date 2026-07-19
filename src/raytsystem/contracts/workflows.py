@@ -62,6 +62,7 @@ class PendingWorkflowApproval(VersionedModel):
 
     schema_name: Literal["PendingWorkflowApprovalV1"] = "PendingWorkflowApprovalV1"
     workflow_run_id: Identifier
+    revision_id: Identifier
     step_run_id: Identifier
     node_id: Identifier
     approval_gate_id: Identifier
@@ -69,12 +70,28 @@ class PendingWorkflowApproval(VersionedModel):
     target_id: Identifier
     input_sha256: Sha256
     scope_sha256: Sha256
+    policy_version: NonEmptyStr
     required_role: Identifier
     expires_at: AwareDatetime
 
     @field_validator("expires_at")
     @classmethod
     def _expiry_utc(cls, value: datetime) -> datetime:
+        return value.astimezone(UTC)
+
+
+class PendingWorkflowApprovalPage(VersionedModel):
+    """One consistency-bound page of exact pending workflow approvals."""
+
+    schema_name: Literal["PendingWorkflowApprovalPageV1"] = "PendingWorkflowApprovalPageV1"
+    items: tuple[PendingWorkflowApproval, ...]
+    next_cursor: str | None = Field(default=None, min_length=16, max_length=4096)
+    snapshot_id: Identifier
+    observed_at: AwareDatetime
+
+    @field_validator("observed_at")
+    @classmethod
+    def _observed_utc(cls, value: datetime) -> datetime:
         return value.astimezone(UTC)
 
 

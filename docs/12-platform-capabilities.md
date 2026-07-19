@@ -133,8 +133,15 @@ its parent). Flags that gate an external surface stay off:
 - Cycle rejection, per-node retry policies, timeout enforcement, approval gates bound to fresh
   approvals, explicit pause/resume/cancel with state guards, persisted step outputs for crash
   recovery, exact idempotent grant/deny receipts committed with the transition event, and DAG graph
-  data for the UI. Approval decision retries require the original key and exact run/node/step,
-  actor, input, gate/policy/expiry, decision, and approval-ID binding.
+  data for the UI. Approval decision retries require the original key and exact run/revision/
+  node/step, actor, input, gate/policy/expiry, decision, and approval-ID binding. Deny also requires
+  the exact public `PendingWorkflowApproval` previously observed; its complete binding is compared
+  under the decision transaction before any state change or audit event.
+- `ApprovalAuthorityService.list_pending` enumerates every canonical run, including runs pinned to
+  historical workflow revisions, without a hidden snapshot cap. It returns frozen, keyset-paginated
+  `PendingWorkflowApprovalPage` records in `(run_id, node_id, step_run_id)` order. Workspace-local
+  HMAC-signed cursors bind the original store snapshot and observation time; tampering or concurrent
+  mutation fails closed and requires a fresh enumeration.
 - CLI: `raytsystem workflow list | approve | cancel`.
 
 ## Notifications

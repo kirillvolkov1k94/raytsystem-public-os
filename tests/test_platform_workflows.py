@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from inspect import signature
 from pathlib import Path
 from threading import Event, get_ident
 from typing import Any
@@ -14,8 +15,10 @@ import pytest
 from pydantic import ValidationError
 
 from platform_helpers import make_platform_workspace, store_approval
+from raytsystem.authority import AuthorityError
 from raytsystem.contracts import (
     ApprovalRecord,
+    PendingWorkflowApproval,
     WorkflowApprovalGate,
     WorkflowDefinition,
     WorkflowEdge,
@@ -191,6 +194,19 @@ def _decision_receipt_count(root: Path) -> int:
         ).fetchone()
     assert row is not None
     return int(row[0])
+
+
+def _pending_binding(
+    root: Path,
+    workflow_run_id: str,
+    *,
+    at: datetime | None = None,
+) -> PendingWorkflowApproval:
+    return ApprovalAuthorityService(root).inspect_pending(
+        workflow_run_id,
+        "step_gate",
+        at=at,
+    )
 
 
 def _rewrite_head_payload(
@@ -457,9 +473,11 @@ def test_deny_approval_fails_the_run(tmp_path: Path) -> None:
     )
     run = _start(service, revision)
     service.run_ready_steps(run.workflow_run_id)
+    expected = _pending_binding(root, run.workflow_run_id)
     denied = service.deny_approval(
         run.workflow_run_id,
         "step_gate",
+        expected=expected,
         actor_id=ACTOR,
         idempotency_key="platform_workflow_deny_decision",
     )
@@ -467,6 +485,220 @@ def test_deny_approval_fails_the_run(tmp_path: Path) -> None:
     record = _step_head(root, run.step_run_ids[0])
     assert record.state == "failed"
     assert record.payload["failure_reason"] == "approval_denied"
+
+
+def test_deny_approval_requires_a_typed_expected_pending_binding() -> None:
+    parameter = signature(WorkflowService.deny_approval).parameters.get("expected")
+
+    assert parameter is not None
+    assert parameter.default is parameter.empty
+    assert parameter.annotation in {PendingWorkflowApproval, "PendingWorkflowApproval"}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("revision_id", "wrev_changed_expected"),
+        ("step_run_id", "wstep_changed_expected"),
+        ("action", "workflow_other_action"),
+        ("target_id", "wfappr_changed_expected"),
+        ("input_sha256", "d" * 64),
+        ("scope_sha256", "d" * 64),
+        ("policy_version", "1.5.0"),
+        ("required_role", "role_reviewer"),
+        ("expires_at", DECISION_WAIT_STARTED + timedelta(seconds=121)),
+    ],
+)
+def test_deny_approval_rejects_changed_expected_binding_without_side_effect(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    root = make_platform_workspace(tmp_path / field)
+    service, run, _ = _waiting_approval(root, start_key=f"deny_expected_{field}")
+    expected = _pending_binding(
+        root,
+        run.workflow_run_id,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+    )
+
+    with pytest.raises(WorkflowError, match=r"binding|expected|pending"):
+        service.deny_approval(
+            run.workflow_run_id,
+            "step_gate",
+            expected=expected.model_copy(update={field: value}),
+            actor_id=ACTOR,
+            idempotency_key=f"deny_expected_decision_{field}",
+            at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+        )
+
+    assert _step_head(root, run.step_run_ids[0]).state == "waiting"
+    assert _decision_events(root, run.workflow_run_id) == ()
+    assert _decision_receipt_count(root) == 0
+
+
+def test_deny_approval_rejects_transient_pending_inspection_without_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, run, _ = _waiting_approval(root, start_key="deny_inspection_unavailable")
+    expected = _pending_binding(
+        root,
+        run.workflow_run_id,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+    )
+
+    def _unavailable(*_args: object, **_kwargs: object) -> object:
+        raise AuthorityError("Workflow approval state is unavailable")
+
+    monkeypatch.setattr(ApprovalAuthorityService, "_pending_context", _unavailable)
+
+    with pytest.raises(WorkflowError, match=r"unavailable|binding"):
+        service.deny_approval(
+            run.workflow_run_id,
+            "step_gate",
+            expected=expected,
+            actor_id=ACTOR,
+            idempotency_key="deny_inspection_unavailable_decision",
+            at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+        )
+
+    assert _step_head(root, run.step_run_ids[0]).state == "waiting"
+    assert _decision_events(root, run.workflow_run_id) == ()
+    assert _decision_receipt_count(root) == 0
+
+
+def test_deny_replay_rejects_same_key_with_changed_expected_binding(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, run, _ = _waiting_approval(root, start_key="deny_expected_replay")
+    expected = _pending_binding(
+        root,
+        run.workflow_run_id,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+    )
+    decision_key = "deny_expected_replay_decision"
+    first = service.deny_approval(
+        run.workflow_run_id,
+        "step_gate",
+        expected=expected,
+        actor_id=ACTOR,
+        idempotency_key=decision_key,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+    )
+
+    with pytest.raises(WorkflowError, match=r"idempotency|binding"):
+        service.deny_approval(
+            run.workflow_run_id,
+            "step_gate",
+            expected=expected.model_copy(update={"required_role": "role_reviewer"}),
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+        )
+
+    assert first.state == "failed"
+    assert len(_decision_events(root, run.workflow_run_id)) == 1
+    assert _decision_receipt_count(root) == 1
+
+
+def test_deny_replay_rejects_changed_workflow_revision_head(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, run, _ = _waiting_approval(root, start_key="deny_revision_replay")
+    expected = _pending_binding(
+        root,
+        run.workflow_run_id,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+    )
+    decision_key = "deny_revision_replay_decision"
+    service.deny_approval(
+        run.workflow_run_id,
+        "step_gate",
+        expected=expected,
+        actor_id=ACTOR,
+        idempotency_key=decision_key,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+    )
+    with initialize_platform_store(root) as store:
+        revision = store.head("workflow_revision", run.revision_id)
+        assert revision is not None
+        store.append_record(
+            kind=revision.kind,
+            record_id=revision.record_id,
+            payload=revision.payload,
+            state=revision.state,
+            expected_revision=revision.revision,
+        )
+
+    with pytest.raises(WorkflowError, match=r"revision|binding|receipt"):
+        service.deny_approval(
+            run.workflow_run_id,
+            "step_gate",
+            expected=expected,
+            actor_id=ACTOR,
+            idempotency_key=decision_key,
+            at=DECISION_WAIT_STARTED + timedelta(seconds=3),
+        )
+
+    assert len(_decision_events(root, run.workflow_run_id)) == 1
+    assert _decision_receipt_count(root) == 1
+
+
+def test_deny_rejects_workflow_revision_changed_after_inspection(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, run, _ = _waiting_approval(root, start_key="deny_revision_cas")
+    expected = _pending_binding(
+        root,
+        run.workflow_run_id,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+    )
+    alternate = _revision(
+        (
+            _node(
+                "step_gate",
+                WorkflowNodeType.APPROVAL,
+                approval_gate_id=GATE.approval_gate_id,
+            ),
+        ),
+        (),
+        revision_id="wrev_deny_revision_cas",
+        version="1.0.1",
+    )
+    service.register(_definition(), alternate, actor_id=ACTOR, approval_gates=(GATE,))
+    _append_run_head(root, run.workflow_run_id, revision_id=alternate.revision_id)
+
+    with pytest.raises(WorkflowError, match=r"expected|binding|idempotency"):
+        service.deny_approval(
+            run.workflow_run_id,
+            "step_gate",
+            expected=expected,
+            actor_id=ACTOR,
+            idempotency_key="deny_revision_cas_decision",
+            at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+        )
+
+    assert _step_head(root, run.step_run_ids[0]).state == "waiting"
+    assert _decision_events(root, run.workflow_run_id) == ()
+    assert _decision_receipt_count(root) == 0
+
+
+def test_deny_approval_rejects_malformed_expected_contract(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    service, run, _ = _waiting_approval(root, start_key="deny_malformed_expected")
+
+    with pytest.raises(WorkflowError, match=r"expected|binding"):
+        service.deny_approval(
+            run.workflow_run_id,
+            "step_gate",
+            expected={},  # type: ignore[arg-type]
+            actor_id=ACTOR,
+            idempotency_key="deny_malformed_expected_decision",
+            at=DECISION_WAIT_STARTED + timedelta(seconds=2),
+        )
+
+    assert _step_head(root, run.step_run_ids[0]).state == "waiting"
+    assert _decision_events(root, run.workflow_run_id) == ()
+    assert _decision_receipt_count(root) == 0
 
 
 def test_crash_recovery_resumes_without_reexecuting_steps(tmp_path: Path) -> None:
@@ -644,6 +876,11 @@ def test_workflow_decision_crash_replay_returns_original_run_without_second_even
     service, run, approval = _waiting_approval(root, start_key=f"decision_crash_{decision}")
     decision_key = f"decision_crash_replay_{decision}"
     decided_at = DECISION_WAIT_STARTED + timedelta(seconds=2)
+    expected = _pending_binding(
+        root,
+        run.workflow_run_id,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+    )
 
     if decision == "grant":
         first = service.grant_approval(
@@ -658,6 +895,7 @@ def test_workflow_decision_crash_replay_returns_original_run_without_second_even
         first = service.deny_approval(
             run.workflow_run_id,
             "step_gate",
+            expected=expected,
             actor_id=ACTOR,
             idempotency_key=decision_key,
             at=decided_at,
@@ -683,6 +921,7 @@ def test_workflow_decision_crash_replay_returns_original_run_without_second_even
         replay = recovered.deny_approval(
             run.workflow_run_id,
             "step_gate",
+            expected=expected,
             actor_id=ACTOR,
             idempotency_key=decision_key,
             at=replay_at,
@@ -834,6 +1073,11 @@ def test_concurrent_exact_workflow_decisions_commit_one_transition_and_receipt(
 ) -> None:
     root = make_platform_workspace(tmp_path / decision)
     _, run, approval = _waiting_approval(root, start_key=f"decision_concurrent_{decision}")
+    expected = _pending_binding(
+        root,
+        run.workflow_run_id,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+    )
 
     def _decide(_: int) -> WorkflowRun:
         service = WorkflowService(root)
@@ -849,6 +1093,7 @@ def test_concurrent_exact_workflow_decisions_commit_one_transition_and_receipt(
         return service.deny_approval(
             run.workflow_run_id,
             "step_gate",
+            expected=expected,
             actor_id=ACTOR,
             idempotency_key=f"decision_concurrent_exact_{decision}",
             at=DECISION_WAIT_STARTED + timedelta(seconds=2),
@@ -868,6 +1113,11 @@ def test_workflow_decision_key_cannot_rebind_or_manufacture_terminal_success(
     root = make_platform_workspace(tmp_path)
     service, run, approval = _waiting_approval(root, start_key="decision_binding")
     decision_key = "decision_binding_exact"
+    expected = _pending_binding(
+        root,
+        run.workflow_run_id,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+    )
     service.grant_approval(
         run.workflow_run_id,
         "step_gate",
@@ -899,6 +1149,7 @@ def test_workflow_decision_key_cannot_rebind_or_manufacture_terminal_success(
         service.deny_approval(
             run.workflow_run_id,
             "step_gate",
+            expected=expected,
             actor_id=ACTOR,
             idempotency_key=decision_key,
             at=DECISION_WAIT_STARTED + timedelta(seconds=3),
@@ -1075,6 +1326,11 @@ def test_workflow_decision_receipt_event_and_transition_roll_back_together(
 ) -> None:
     root = make_platform_workspace(tmp_path / decision)
     service, run, approval = _waiting_approval(root, start_key=f"decision_rollback_{decision}")
+    expected = _pending_binding(
+        root,
+        run.workflow_run_id,
+        at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+    )
     original = PlatformStore.idempotent_receipt
 
     class SimulatedCrash(RuntimeError):
@@ -1115,6 +1371,7 @@ def test_workflow_decision_receipt_event_and_transition_roll_back_together(
                 service.deny_approval(
                     run.workflow_run_id,
                     "step_gate",
+                    expected=expected,
                     actor_id=ACTOR,
                     idempotency_key=f"decision_rollback_exact_{decision}",
                     at=DECISION_WAIT_STARTED + timedelta(seconds=2),
@@ -1145,6 +1402,7 @@ def test_deny_default_time_is_sampled_after_writer_lock(
     )
     run = _start(service, revision)
     service.run_ready_steps(run.workflow_run_id)
+    expected = _pending_binding(root, run.workflow_run_id)
     transaction_attempted = Event()
     test_thread = get_ident()
     original_transaction = PlatformStore.transaction
@@ -1165,6 +1423,7 @@ def test_deny_default_time_is_sampled_after_writer_lock(
                 service.deny_approval,
                 run.workflow_run_id,
                 "step_gate",
+                expected=expected,
                 actor_id=ACTOR,
                 idempotency_key="decision_deny_lock_time",
             )
@@ -1190,6 +1449,12 @@ def test_workflow_decisions_require_exact_nonempty_key_and_aware_time(
     }
     if decision == "grant":
         kwargs["approval_id"] = approval.approval_id
+    else:
+        kwargs["expected"] = _pending_binding(
+            root,
+            run.workflow_run_id,
+            at=DECISION_WAIT_STARTED + timedelta(seconds=1),
+        )
     operation = service.grant_approval if decision == "grant" else service.deny_approval
 
     with pytest.raises(WorkflowError, match="idempotency"):

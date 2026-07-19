@@ -15,11 +15,14 @@ import pytest
 from pydantic import ValidationError
 
 import raytsystem.authority as authority_module
+import raytsystem.contracts as contracts_module
+import raytsystem.workflows as workflows_module
 from platform_helpers import make_platform_workspace
 from raytsystem.authority import AuthorityError, AuthorityResolver
 from raytsystem.contracts import (
     ApprovalRecord,
     PendingWorkflowApproval,
+    PendingWorkflowApprovalPage,
     WorkflowApprovalGate,
     WorkflowDefinition,
     WorkflowNode,
@@ -118,6 +121,58 @@ def _start_waiting(
     )
     service.run_ready_steps(run.workflow_run_id, at=WAIT_STARTED)
     return service, run.workflow_run_id
+
+
+def _historical_pending_runs(
+    root: Path,
+    *,
+    revision_count: int,
+    runs_per_revision: int,
+) -> tuple[tuple[str, str], ...]:
+    service = WorkflowService(root)
+    runs: list[tuple[str, str]] = []
+    previous_revision_id: str | None = None
+    for revision_index in range(revision_count):
+        revision_id = f"wrev_authority_history_{revision_index:03d}"
+        draft = _revision().model_copy(
+            update={
+                "revision_id": revision_id,
+                "version": f"1.{revision_index}.0",
+                "previous_revision_id": previous_revision_id,
+                "created_at": datetime(2040, 1, 1, tzinfo=UTC)
+                + timedelta(seconds=revision_index),
+                "manifest_sha256": "0" * 64,
+            }
+        )
+        manifest = sha256_hex(
+            canonical_json_bytes(
+                draft.model_dump(mode="json", exclude={"manifest_sha256"})
+            )
+        )
+        revision = draft.model_copy(update={"manifest_sha256": manifest})
+        service.register(
+            WorkflowDefinition(
+                workflow_id=revision.workflow_id,
+                name="Authority workflow",
+                description="Approval authority history fixture",
+                enabled=True,
+            ),
+            revision,
+            actor_id=ACTOR,
+            approval_gates=(GATE,),
+        )
+        for run_index in range(runs_per_revision):
+            key = f"workflow_history_{revision_index:03d}_{run_index:03d}"
+            run = service.start(
+                revision.revision_id,
+                {"seed": key},
+                actor_id=ACTOR,
+                idempotency_key=key,
+            )
+            service.run_ready_steps(run.workflow_run_id, at=WAIT_STARTED)
+            runs.append((run.workflow_run_id, revision.revision_id))
+        previous_revision_id = revision.revision_id
+    return tuple(runs)
 
 
 def _approval_count(root: Path) -> int:
@@ -266,6 +321,7 @@ def test_inspect_pending_returns_exact_immutable_trusted_binding(tmp_path: Path)
 
     assert pending == PendingWorkflowApproval(
         workflow_run_id=workflow_run_id,
+        revision_id="wrev_authority_test",
         step_run_id=derive_id(
             "wstep", {"workflow_run_id": workflow_run_id, "node_id": "step_gate"}
         ),
@@ -277,12 +333,243 @@ def test_inspect_pending_returns_exact_immutable_trusted_binding(tmp_path: Path)
         ),
         input_sha256=sha256_hex(canonical_json_bytes({"seed": "value"})),
         scope_sha256=GATE.scope_sha256,
+        policy_version=GATE.schema_version,
         required_role=GATE.required_role,
         expires_at=WAIT_STARTED + timedelta(seconds=GATE.expires_after_seconds),
     )
     assert pending.expires_at.tzinfo is UTC
     with pytest.raises(ValidationError, match="frozen"):
         pending.node_id = "step_other"  # type: ignore[misc]
+
+
+def test_pending_workflow_approval_binds_workflow_and_policy_revisions() -> None:
+    assert "revision_id" in PendingWorkflowApproval.model_fields
+    assert "policy_version" in PendingWorkflowApproval.model_fields
+
+
+def test_pending_approval_page_is_a_public_frozen_contract() -> None:
+    page_type = getattr(contracts_module, "PendingWorkflowApprovalPage", None)
+
+    assert page_type is not None
+    assert getattr(workflows_module, "PendingWorkflowApprovalPage", None) is page_type
+    assert tuple(page_type.model_fields) == (
+        "schema_name",
+        "schema_version",
+        "id_scheme_version",
+        "extensions",
+        "items",
+        "next_cursor",
+        "snapshot_id",
+        "observed_at",
+    )
+
+
+def test_list_pending_returns_an_exact_consistency_bound_page(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    _, workflow_run_id = _start_waiting(root)
+    authority = ApprovalAuthorityService(root)
+    observed_at = WAIT_STARTED + timedelta(seconds=10)
+
+    page = authority.list_pending(limit=1, at=observed_at)
+
+    assert type(page) is PendingWorkflowApprovalPage
+    assert page.items == (
+        authority.inspect_pending(workflow_run_id, "step_gate", at=observed_at),
+    )
+    assert page.next_cursor is None
+    assert page.snapshot_id.startswith("pview_")
+    assert page.observed_at == observed_at
+    with pytest.raises(ValidationError, match="frozen"):
+        page.next_cursor = "changed"  # type: ignore[misc]
+
+
+def test_list_pending_traverses_204_runs_across_51_historical_revisions(
+    tmp_path: Path,
+) -> None:
+    root = make_platform_workspace(tmp_path)
+    expected_runs = _historical_pending_runs(
+        root,
+        revision_count=51,
+        runs_per_revision=4,
+    )
+    authority = ApprovalAuthorityService(root)
+    observed_at = WAIT_STARTED + timedelta(seconds=10)
+    cursor: str | None = None
+    pages: list[PendingWorkflowApprovalPage] = []
+    observed: list[PendingWorkflowApproval] = []
+
+    while True:
+        page = authority.list_pending(
+            limit=37,
+            cursor=cursor,
+            at=observed_at if cursor is None else None,
+        )
+        pages.append(page)
+        observed.extend(page.items)
+        cursor = page.next_cursor
+        if cursor is None:
+            break
+
+    assert len(expected_runs) == 204
+    assert len({revision_id for _, revision_id in expected_runs}) == 51
+    assert len(observed) == 204
+    assert len({item.target_id for item in observed}) == 204
+    assert [(item.workflow_run_id, item.node_id, item.step_run_id) for item in observed] == sorted(
+        (item.workflow_run_id, item.node_id, item.step_run_id) for item in observed
+    )
+    assert {item.revision_id for item in observed} == {
+        revision_id for _, revision_id in expected_runs
+    }
+    assert len(pages) == 6
+    assert [len(page.items) for page in pages] == [37, 37, 37, 37, 37, 19]
+    assert len({page.snapshot_id for page in pages}) == 1
+    assert all(page.observed_at == observed_at for page in pages)
+
+
+def test_list_pending_cursor_is_opaque_and_tampering_fails_closed(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    for index in range(3):
+        _start_waiting(root, idempotency_key=f"workflow_cursor_{index}")
+    authority = ApprovalAuthorityService(root)
+    observed_at = WAIT_STARTED + timedelta(seconds=10)
+
+    first = authority.list_pending(limit=1, at=observed_at)
+
+    assert first.next_cursor is not None
+    assert first.items[0].workflow_run_id not in first.next_cursor
+    assert first.items[0].node_id not in first.next_cursor
+    replacement = "A" if first.next_cursor[-1] != "A" else "B"
+    tampered = f"{first.next_cursor[:-1]}{replacement}"
+    with pytest.raises(AuthorityError, match="cursor"):
+        authority.list_pending(limit=1, cursor=tampered)
+
+    second = authority.list_pending(limit=1, cursor=first.next_cursor)
+    assert second.snapshot_id == first.snapshot_id
+    assert second.observed_at == first.observed_at
+    assert second.items[0].target_id != first.items[0].target_id
+
+
+def test_list_pending_rejects_noncanonical_cursor_encoding(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    for index in range(2):
+        _start_waiting(root, idempotency_key=f"workflow_cursor_alias_{index}")
+    first = ApprovalAuthorityService(root).list_pending(
+        limit=1,
+        at=WAIT_STARTED + timedelta(seconds=10),
+    )
+    assert first.next_cursor is not None
+    encoded_payload, encoded_signature = first.next_cursor.split(".")
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    final_index = alphabet.index(encoded_signature[-1])
+    assert final_index % 4 == 0
+    alias = alphabet[final_index + 1]
+    noncanonical = f"{encoded_payload}.{encoded_signature[:-1]}{alias}"
+
+    with pytest.raises(AuthorityError, match="cursor"):
+        ApprovalAuthorityService(root).list_pending(limit=1, cursor=noncanonical)
+
+
+def test_list_pending_cursor_rejects_concurrent_transition(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    for index in range(3):
+        _start_waiting(root, idempotency_key=f"workflow_concurrent_page_{index}")
+    authority = ApprovalAuthorityService(root)
+    observed_at = WAIT_STARTED + timedelta(seconds=10)
+    first = authority.list_pending(limit=1, at=observed_at)
+    assert first.next_cursor is not None
+    expected = first.items[0]
+
+    WorkflowService(root).deny_approval(
+        expected.workflow_run_id,
+        expected.node_id,
+        expected=expected,
+        actor_id=ACTOR,
+        idempotency_key="workflow_concurrent_page_deny",
+        at=observed_at + timedelta(seconds=1),
+    )
+
+    with pytest.raises(AuthorityError, match=r"concurrent|changed"):
+        authority.list_pending(limit=1, cursor=first.next_cursor)
+
+
+def test_list_pending_cursor_rejects_changed_observation_time(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    for index in range(2):
+        _start_waiting(root, idempotency_key=f"workflow_observation_page_{index}")
+    authority = ApprovalAuthorityService(root)
+    observed_at = WAIT_STARTED + timedelta(seconds=10)
+    first = authority.list_pending(limit=1, at=observed_at)
+    assert first.next_cursor is not None
+
+    with pytest.raises(AuthorityError, match=r"observation|consistent"):
+        authority.list_pending(
+            limit=1,
+            cursor=first.next_cursor,
+            at=observed_at + timedelta(seconds=1),
+        )
+
+
+def test_list_pending_fails_closed_on_corrupt_canonical_step(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    _, workflow_run_id = _start_waiting(root)
+    step = _step_head(root, workflow_run_id)
+    changed = dict(step.payload)
+    changed["workflow_run_id"] = "wrun_foreign_binding"
+    rendered = canonical_json_bytes(changed)
+    digest = sha256_hex(rendered)
+    with initialize_platform_store(root) as store, store.transaction():
+        store.connection.execute(
+            "UPDATE records SET payload_json=?, payload_sha256=? "
+            "WHERE kind=? AND record_id=? AND revision=?",
+            (
+                rendered.decode("utf-8"),
+                digest,
+                step.kind,
+                step.record_id,
+                step.revision,
+            ),
+        )
+        store.connection.execute(
+            "UPDATE record_heads SET payload_sha256=? WHERE kind=? AND record_id=?",
+            (digest, step.kind, step.record_id),
+        )
+
+    with pytest.raises(AuthorityError, match=r"invalid|binding"):
+        ApprovalAuthorityService(root).list_pending(
+            limit=10,
+            at=WAIT_STARTED + timedelta(seconds=10),
+        )
+
+
+def test_list_pending_fails_closed_on_orphan_canonical_run_head(tmp_path: Path) -> None:
+    root = make_platform_workspace(tmp_path)
+    _, workflow_run_id = _start_waiting(root)
+    with initialize_platform_store(root) as store:
+        head = store.head("workflow_run", workflow_run_id)
+        assert head is not None
+        store.connection.execute("PRAGMA foreign_keys=OFF")
+        with store.transaction():
+            store.connection.execute(
+                "DELETE FROM records WHERE kind=? AND record_id=? AND revision=?",
+                (head.kind, head.record_id, head.revision),
+            )
+
+    with pytest.raises(AuthorityError):
+        ApprovalAuthorityService(root).list_pending(
+            limit=10,
+            at=WAIT_STARTED + timedelta(seconds=10),
+        )
+
+
+@pytest.mark.parametrize("limit", [0, 501, True, "10"])
+def test_list_pending_rejects_unbounded_or_malformed_limit(
+    tmp_path: Path,
+    limit: object,
+) -> None:
+    root = make_platform_workspace(tmp_path)
+
+    with pytest.raises(AuthorityError, match="limit"):
+        ApprovalAuthorityService(root).list_pending(limit=limit)  # type: ignore[arg-type]
 
 
 def test_exact_issuance_is_persisted_idempotently_without_transition(tmp_path: Path) -> None:
